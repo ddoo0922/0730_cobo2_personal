@@ -249,7 +249,9 @@ class MoveGroupExecClient:
     def send_goal(self, constraints: Constraints,
                   vel_scale: float, acc_scale: float,
                   allowed_planning_time: float = 10.0,
-                  wait: bool = True, wait_timeout: float = 120.0):
+                  wait: bool = True, wait_timeout: float = 120.0,
+                  replan: bool = False, replan_attempts: int = 3,
+                  replan_delay: float = 0.5):
         """MoveGroup goal 을 보낸다.
 
         wait=True  : 원본과 동일. plan+execute 가 **끝날 때까지 블록**하고 결과를 돌려준다.
@@ -274,6 +276,36 @@ class MoveGroupExecClient:
         # 🔴 이 한 줄이 reactive_replan.py 와의 근본 차이다.
         #    False = move_group 이 계획하고 **실행까지** 한다(실행관리자·start tolerance 경유).
         goal_msg.planning_options.plan_only = False
+
+        # ═══ 🔴 STOP_REPLAN — MoveIt 내장 동적 회피 ═══════════════════════════
+        #   PlanningOptions.msg 원문:
+        #     "If the plan becomes invalidated during execution, it is possible to have
+        #      that plan recomputed and execution restarted. This flag enables this functionality"
+        #
+        #   즉 move_group 의 plan_execution 이 **실행 중 planning scene 을 감시**하다가
+        #   남은 경로가 무효가 되면 멈추고 다시 계획한다. 우리가 손으로 만든 루프와
+        #   같은 일을 MoveIt 이 대신 해준다.
+        #
+        #   ✅ 2026-08-08 실기 확인: pick_fsm(octomap + OMPL + replan:true) 에서
+        #      이동 중 장애물을 넣으면 **멈췄다가 재계산해 우회**했다. 이 기능은 동작한다.
+        #
+        #   🔴 감시와 계획이 **다른 지도**를 보면 라이브락이 날 수 있다:
+        #        감시  = MoveIt planning scene = **octomap** (해상도 0.1, padding 부풀리기)
+        #        계획  = cuMotion              = **nvblox ESDF** (해상도 0.05, T4 세그멘터)
+        #      octomap 이 "이 경로 무효"라고 거부했는데 cuMotion 은 nvblox 기준으로
+        #      문제없다며 **같은 경로를 다시 낸다** → 무한 반복 → replan_attempts 소진.
+        #      cuMotion 은 왜 거부당했는지 모르고, 다른 지도를 보니 고칠 수도 없다.
+        #
+        #      ⚠️ 이미 그 불일치의 증거가 있다: MoveIt 은 계획 직후에도 cuMotion 궤적을
+        #         planning scene 으로 재검증하고(check_solution_paths_), 그게
+        #         INVALID_MOTION_PLAN(-2) 다 — README 0-2 절 실패율 6~17%.
+        #         replan 은 그 결합을 **실행 구간까지 확장**한다.
+        #
+        #   실험 순서: pipeline:=ompl 로 먼저(감시·계획이 같은 지도 → 라이브락 없음)
+        #              → pipeline:=isaac_ros_cumotion 으로 하이브리드 시험
+        goal_msg.planning_options.replan = bool(replan)
+        goal_msg.planning_options.replan_attempts = int(replan_attempts)
+        goal_msg.planning_options.replan_delay = float(replan_delay)
 
         send_future = self._client.send_goal_async(goal_msg)
         send_future.add_done_callback(self._goal_response_cb)
@@ -389,6 +421,17 @@ class GoalSetterReplanNode(Node):
         #    기본 false = 2026-08-08 에 실측한 것과 같은 조건(비교 기준을 유지한다).
         self.cancel_previous = bool(p('cancel_previous', False).value)
 
+        # ═══ 🔴 STOP_REPLAN — MoveIt 내장 동적 회피 (send_goal 주석이 본체다) ═══
+        #   true 면 move_group 이 실행 중 planning scene 을 감시하다가 경로가 무효가 되면
+        #   멈추고 다시 계획한다. **우리가 손으로 만든 루프와 같은 일을 MoveIt 이 한다.**
+        #   ✅ pick_fsm(octomap+OMPL)에서 실기 확인됨 — 멈췄다가 재계산해 우회
+        #   🔴 pipeline:=isaac_ros_cumotion 과 함께 켜면 감시(octomap)와 계획(nvblox)이
+        #      다른 지도를 봐서 라이브락 위험이 있다. 그걸 보려는 게 이 실험이다.
+        #   기본 false = 지금까지 실측한 조건(비교 기준 유지)
+        self.replan = bool(p('replan', False).value)
+        self.replan_attempts = int(p('replan_attempts', 3).value)
+        self.replan_delay = float(p('replan_delay', 0.5).value)
+
         self._cb = ReentrantCallbackGroup()
         self._js_lock = threading.Lock()
         self._js_pos: dict = {}
@@ -416,12 +459,28 @@ class GoalSetterReplanNode(Node):
 
         self.get_logger().info(
             f'모드={self.mode} / plan_timer_period={self.plan_timer_period}s / '
-            f'vel={self.vel_scale} / goal_type={self.goal_type}')
-        if self.mode == 'sequential':
+            f'vel={self.vel_scale} / goal_type={self.goal_type} / '
+            f'waypoints={self.waypoints} / replan={self.replan}')
+
+        if self.replan:
+            # 🔴 replan 을 켜면 sequential 의 "실행 중엔 안 바뀐다"가 더 이상 참이 아니다.
             self.get_logger().warn(
-                '🔴 sequential 은 예제 원본 거동이다 — 실행이 끝나야 다음 계획을 던진다. '
+                f'🔴 STOP_REPLAN 켜짐 (attempts={self.replan_attempts}, '
+                f'delay={self.replan_delay}s) — move_group 이 실행 중 planning scene 을 '
+                '감시하다가 경로가 무효가 되면 **멈추고 다시 계획한다.**')
+            self.get_logger().warn(
+                f'   감시 = MoveIt planning scene(octomap) / 계획 = {self.pipeline_id}')
+            if self.pipeline_id != 'ompl':
+                self.get_logger().warn(
+                    '   ⚠️ 감시와 계획이 **다른 지도**를 본다(octomap vs nvblox). '
+                    'octomap 이 거부한 경로를 cuMotion 이 같은 걸로 다시 낼 수 있다 '
+                    '→ 멈춤-재계획 반복(라이브락). 그게 보이면 pipeline:=ompl 과 비교하라.')
+
+        if self.mode == 'sequential' and not self.replan:
+            self.get_logger().warn(
+                '🔴 sequential + replan:=false — 실행이 끝나야 다음 계획을 던진다. '
                 '즉 **실행 중에 장애물이 들어와도 궤적이 안 바뀐다.** 대조군용이다.')
-        else:
+        elif self.mode == 'preemptive':
             self.get_logger().warn(
                 '⚠️ preemptive 는 검증 안 된 실험 모드다. move_group 이 동시 goal 을 '
                 '거부하거나 궤적을 멈췄다 재시작할 수 있다. 그걸 보려는 게 목적이다.')
@@ -661,7 +720,9 @@ class GoalSetterReplanNode(Node):
         try:
             result = self.client.send_goal(
                 constraints, self.vel_scale, self.acc_scale,
-                allowed_planning_time=self.allowed_planning_time, wait=wait)
+                allowed_planning_time=self.allowed_planning_time, wait=wait,
+                replan=self.replan, replan_attempts=self.replan_attempts,
+                replan_delay=self.replan_delay)
         finally:
             self._busy = False
 
