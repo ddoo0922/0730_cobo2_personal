@@ -25,6 +25,21 @@ if [[ -n "${DOOSAN_SETUP:-}" ]]; then
 fi
 set -u
 
-colcon build \
+# .venv must be active *and* colcon must run as a module of its python3 --
+# the apt-installed /usr/bin/colcon binary always runs under /usr/bin/python3
+# regardless of venv activation, so a plain `colcon build` bakes
+# /usr/bin/python3 into the generated console_scripts shebang. Every real
+# node then fails at runtime with ModuleNotFoundError for torch/ultralytics/
+# openai/pymodbus/sounddevice, which live only in .venv (CLAUDE.md #1 forbids
+# --user installs). Reproduced 2026-08-10: `colcon build` -> perception_node
+# crashed with "No module named 'torch'"; `python3 -m colcon build` (venv
+# active) produced the correct .venv shebang.
+if [[ -f "$ROOT/.venv/bin/activate" ]]; then
+  source "$ROOT/.venv/bin/activate"
+else
+  echo "warn: $ROOT/.venv not found; run: python3 -m venv --system-site-packages .venv" >&2
+fi
+
+python3 -m colcon build \
   --symlink-install \
   --packages-select vla_interfaces vla_system

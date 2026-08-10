@@ -65,10 +65,25 @@ cobot2_ws 쪽(`vla_command_node`)은 완성됐다. 이 ws에 아직 없는 것: 
 부분(`pick_and_place`에 `place` 인자 추가, `pick_and_hold`/`release` 제거)은
 `vla-bridge-contract.md` §7 참고.
 
-## 4. 하드웨어
+## 4. 하드웨어 — 🔴 카메라 구성 정정 (2026-08-10, 사용자 확인)
 
-M0609 + OnRobot RG2 + 고정 Webcam(Logitech C270, 탐지) + 손목 Intel RealSense D435i
-(파지 정밀화). cobot2_ws 쪽 D435i(eye-to-hand, 고정)와는 **다른 카메라**다 — 혼동 금지
-(cobot2_ws CLAUDE.md 2절이 이미 이 구분을 명시해뒀다: "cobot2_ws가 쓰는 카메라는 고정
-D435i 한 대뿐, 손목 카메라 없음"— 그건 그쪽 로봇 얘기고, 이 ws의 손목 RealSense는 이 ws
-전용 파이프라인이다).
+M0609 + OnRobot RG2. **고정 카메라는 별도 Logitech C270가 아니라, cobot2_ws의
+`pick_fsm`이 쓰는 것과 같은 물리 D435i다(공유).** 아래 두 문단은 예전 설계로,
+**틀렸다** — cobot2_ws CLAUDE.md 2절의 "D435i는 그쪽 로봇 전용, 이 ws와 다른 카메라"
+서술도 함께 틀렸다는 뜻이니 그쪽을 참고할 때도 이 사실을 우선한다.
+
+**손목(wrist) RealSense D435i 구성은 아직 미정이다.** README의 "고정 웹캠=탐지, 손목
+RealSense=파지 정밀화" 투-카메라 설계가 지금도 유효한지 자체가 불확실 — `vla_wrist`,
+GraspGenX 경로, hand-eye 보정 관련 작업을 시작하기 전에 반드시 먼저 확인할 것.
+상세·후속 확인 목록은 `docs/context/constraints.md` "카메라 구성" 항목.
+
+두 프로세스(vla_perception, cobot2_ws FSM)가 물리 카메라 하나를 어떻게 나눠 쓰는지
+(토픽 공유 vs 각자 독립 오픈)도 미확인 — 독립 오픈이면 V4L2 장치 충돌 가능성이 있다.
+
+<details>
+<summary>예전 설계 서술 (틀림, 기록용으로만 남김)</summary>
+
+~~고정 Webcam(Logitech C270, 탐지) + 손목 Intel RealSense D435i(파지 정밀화).
+cobot2_ws 쪽 D435i(eye-to-hand, 고정)와는 다른 카메라다 — 혼동 금지~~
+
+</details>

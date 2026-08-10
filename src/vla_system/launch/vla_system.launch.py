@@ -1,4 +1,8 @@
-"""Bring up perception, agent, and robot execution. Motion is off by default."""
+"""Bring up perception and agent. Robot execution is off by default -- cobot2_ws's
+pick_fsm owns the M0609/RG2 hardware; vla_robot and gripper.py must not run
+alongside it (shared DRFL connection / Modbus register, see md/plans/
+2026-08-08-vla-integration.md #5-3 in cobot2_ws). Set enable_robot:=true only
+for this node's own standalone DRY-RUN testing with no cobot2_ws FSM running."""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
@@ -15,6 +19,7 @@ def generate_launch_description():
     enable_agent = LaunchConfiguration("enable_agent")
     motion_enabled = LaunchConfiguration("motion_enabled")
     enable_wrist_grasp = LaunchConfiguration("enable_wrist_grasp")
+    enable_robot = LaunchConfiguration("enable_robot")
 
     realsense = GroupAction(
         condition=IfCondition(enable_realsense),
@@ -58,6 +63,9 @@ def generate_launch_description():
             DeclareLaunchArgument("enable_agent", default_value="true"),
             DeclareLaunchArgument("motion_enabled", default_value="false"),
             DeclareLaunchArgument("enable_wrist_grasp", default_value="false"),
+            # Off by default: cobot2_ws's pick_fsm owns the robot/gripper now.
+            # See the launch-time docstring above before flipping this on.
+            DeclareLaunchArgument("enable_robot", default_value="false"),
             realsense,
             Node(
                 package="vla_system",
@@ -79,6 +87,7 @@ def generate_launch_description():
                 executable="robot_node",
                 name="vla_robot",
                 output="screen",
+                condition=IfCondition(enable_robot),
                 parameters=[params_file, {"motion_enabled": motion_enabled}],
             ),
             # Wrist-guided grasping. Off by default at launch level because it

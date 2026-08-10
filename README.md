@@ -358,22 +358,31 @@ ros2 launch vla_system vla_system.launch.py enable_realsense:=false
 ros2 launch vla_system vla_system.launch.py enable_wrist_grasp:=true
 ```
 
-### 2. 실제 로봇
+### 2. 실제 로봇 — 🔴 이 노드에서는 비활성화됨 (2026-08-10)
 
-Doosan bringup과 RG2 네트워크를 먼저 확인한다.
+**`vla_robot`(`robot_node`)과 `robot/gripper.py`는 기본적으로 뜨지 않는다.** 로봇
+실행(모션·IK·충돌회피·그리퍼)은 `cobot2_ws`의 `pick_fsm`이 전담한다 — 감지·행동
+지시는 `cobot2_ws/md/plans/2026-08-08-vla-integration.md`가 정하는 JSON 경계
+(`/vla/pick_command` ↔ `/vla/pick_result`)를 통해 그쪽 FSM으로 넘어간다(브리지
+`vla_pick_bridge`는 같은 문서 §9-5-2, 아직 미착수).
+
+`vla_system.launch.py`는 이제 `enable_robot:=false`가 기본값이라 `vla_robot`이
+아예 안 뜬다. 예전처럼 `motion_enabled:=true`만 주면 실제 로봇이 움직일 거라
+기대하지 말 것 — 노드 자체가 없다.
 
 ```bash
-ros2 launch m0609_rg2_bringup bringup.launch.py \
-  mode:=real host:=192.168.1.100 model:=m0609
+# vla_robot/gripper.py를 이 노드 단독으로(= cobot2_ws pick_fsm이 안 떠 있을 때만) 테스트하려면
+ros2 launch vla_system vla_system.launch.py enable_robot:=true motion_enabled:=true
 ```
 
-GUI에서 **실제 로봇 모션**을 체크한 뒤 시작하거나, 직접:
+🔴 **`cobot2_ws`의 `pick_fsm`이 로봇을 잡고 있는 동안 위 명령을 켜지 말 것.**
+`vla_robot`의 `DSR_ROBOT2`(`amovel`)와 `pick_fsm`의 `dsr_moveit_controller`가
+**같은 DRFL TCP 연결**을 공유하고, `robot/gripper.py`(pymodbus 직결)는 `pick_fsm`
+쪽 `OnRobotRGControllerServer`와 **같은 Modbus 레지스터**에 동시에 쓴다 — 둘 다
+ROS 레벨이 아니라 장비 레벨 충돌이라 에러 없이 조용히 오동작할 수 있다.
 
-```bash
-ros2 launch vla_system vla_system.launch.py motion_enabled:=true
-```
-
-실행 전 `src/vla_system/config/system.yaml`에서 반드시 확인할 것:
+실기로 되돌릴 때 `src/vla_system/config/system.yaml`에서 확인할 것(참고용, 지금은
+이 경로로 실행하지 않는다):
 
 - 테이블 보정(`~/.ros/vla_table_homography.json`)이 현재 Webcam 설치와 테이블
   위치에 맞는가. Webcam이나 테이블을 건드렸으면 다시 측정해야 한다

@@ -514,8 +514,15 @@ class VLAApp:
         )
         self.stop_button.grid(row=0, column=0, padx=(0, 12))
 
+        # vla_robot is disabled at the launch level (enable_robot:=false) --
+        # cobot2_ws's pick_fsm owns the robot/gripper now. Keep the control
+        # visible but inert so it can't silently no-op a checked "real robot"
+        # run: start_pipeline() never passes enable_robot:=true.
         self.robot_check = ttk.Checkbutton(
-            controls, text="실제 로봇 모션", variable=self.real_robot_var
+            controls,
+            text="실제 로봇 모션 (cobot2_ws pick_fsm 전담 — 비활성)",
+            variable=self.real_robot_var,
+            state="disabled",
         )
         self.robot_check.grid(row=0, column=1, padx=(0, 8))
 
@@ -1053,7 +1060,6 @@ class VLAApp:
             pass
 
         self.pipeline_button.configure(text="VLA 시작")
-        self.robot_check.configure(state="normal")
         self.wrist_check.configure(state="normal")
         self.append_chat("system", "GUI가 시작한 VLA 파이프라인을 정지했습니다.")
 
@@ -1081,7 +1087,6 @@ class VLAApp:
             elif kind == "pipeline_exit":
                 self.pipeline_process = None
                 self.pipeline_button.configure(text="VLA 시작")
-                self.robot_check.configure(state="normal")
                 self.wrist_check.configure(state="normal")
                 self.append_chat("system", f"VLA launch 종료: returncode={payload}")
 
