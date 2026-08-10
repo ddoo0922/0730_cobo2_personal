@@ -22,6 +22,16 @@ set +u
 
 source /opt/ros/humble/setup.bash
 
+# Python deps (openai, torch, ultralytics, ...) live in .venv, not ~/.local —
+# ~/.local is shared with the cobot2_ws account and pip installing there broke
+# its colcon build (2026-08-10 incident, see CLAUDE.md §1). The venv must have
+# been created with --system-site-packages so rclpy stays visible.
+if [[ -f "$_vla_root/.venv/bin/activate" ]]; then
+  source "$_vla_root/.venv/bin/activate"
+else
+  echo "note: $_vla_root/.venv not found; run: python3 -m venv --system-site-packages .venv" >&2
+fi
+
 # Overlay with the Doosan packages. scripts/build.sh reads DOOSAN_SETUP too.
 export DOOSAN_SETUP="${DOOSAN_SETUP:-$HOME/cobot_ws/install/setup.bash}"
 if [[ -f "$DOOSAN_SETUP" ]]; then

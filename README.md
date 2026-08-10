@@ -282,13 +282,32 @@ source /opt/ros/humble/setup.bash
 sudo apt update
 sudo apt install -y ros-humble-realsense2-camera portaudio19-dev python3-tk
 
-python3 -m pip install --user -r requirements.txt
+# ⚠️ --user 로 깔지 않는다 — 이 계정(kimkh)은 ~/cobot2_ws 와 공유한다. ~/.local 은 계정
+# 전역이라 여기서 pip install --user 로 깐 opencv-python/pydantic 등이 cobot2_ws 의
+# colcon build·rclpy 노드를 조용히 깬다(2026-08-10 실측 — CLAUDE.md §1).
+# 이 ws 는 rclpy 가 필요한 진짜 ROS 패키지라 일반 venv 는 안 되고 --system-site-packages 다.
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+# --system-site-packages 의 apt packaging(21.3)과 최신 setuptools 가 안 맞을 수 있다
+# (2026-08-10 실측 — vla_interfaces 빌드가 TypeError 로 죽었다):
+python3 -m pip install "setuptools<80,>=30.3.0" "packaging>=23"
 ```
 
 OpenCV는 apt(`python3-opencv`, jammy에서 4.5.4)가 아니라 pip로 받는다 —
 `ultralytics`가 `opencv-python>=4.7`을 요구한다. 대신 4.x에 머물러야 한다:
 `opencv-python` 5.x는 NumPy 2를 강제하고, NumPy는 ROS 2 Humble ABI 호환을 위해
 1.x로 고정돼 있다. `requirements.txt`가 이 조합을 이미 못박아 뒀다.
+
+**설치 전후로 `~/cobot2_ws` 가 멀쩡한지 확인한다** (같은 계정을 공유하므로):
+
+```bash
+source /opt/ros/humble/setup.bash && source ~/cobot2_ws/install/setup.bash
+cd ~/cobot2_ws && colcon build --symlink-install --packages-select voice_processing pick_fsm
+```
+
+이게 실패로 바뀌었으면 방금 설치가 `~/.local`을 건드린 것이다 — `.venv` 활성화 없이
+`pip install`을 부르지 않았는지부터 본다. 상세는 `CLAUDE.md` §1.
 
 Doosan ROS 2 패키지(`dsr_common2`, `dsr_msgs2`, `DSR_ROBOT2`)가 들어 있는
 overlay를 먼저 source한다. `scripts/env.sh`가 ROS · Doosan overlay ·
@@ -399,7 +418,8 @@ ros2 launch vla_system vla_system.launch.py motion_enabled:=true
 ## 테스트
 
 ```bash
-python3 -m pip install --user -r requirements-dev.txt
+source .venv/bin/activate   # 없으면 위 설치 절부터 (--user 금지 — CLAUDE.md §1)
+python3 -m pip install -r requirements-dev.txt
 ./scripts/check.sh
 ```
 
