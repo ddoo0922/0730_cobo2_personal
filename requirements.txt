@@ -1,0 +1,20 @@
+# Keep NumPy 1.x for ROS 2 Humble / Ubuntu 22.04 OpenCV ABI compatibility.
+numpy>=1.23.5,<2.0
+PyYAML>=6.0,<7.0
+
+# Voice + LLM command boundary
+openai>=1.68.0,<3.0
+python-dotenv>=1.0,<2.0
+sounddevice>=0.4.6,<1.0
+scipy>=1.10,<2.0
+
+# Perception
+ultralytics>=8.4.0,<9.0
+openvino>=2024.6,<2027.0
+# ultralytics requires opencv-python>=4.7, newer than Jammy's apt python3-opencv
+# (4.5.4). Stay on 4.x: opencv-python 5.x requires NumPy 2 and would fight the
+# NumPy pin above.
+opencv-python>=4.10,<4.13
+
+# OnRobot RG2/RG6 legacy synchronous client API
+pymodbus==2.5.3

@@ -1,0 +1,12 @@
+{
+  "description": "Fixed-camera eye-to-hand calibration copied from corecode/Calibration_Tutorial/T_cam2base.npy; translation unit is millimetres.",
+  "from_frame": "camera_color_optical_frame",
+  "to_frame": "base",
+  "translation_unit": "mm",
+  "matrix": [
+    [0.9986649334581664, -0.02574607606047735, -0.04478270032594048, 365.6530282468577],
+    [0.020838259138720408, -0.5924754575294006, 0.8053189425199163, -876.6164484614054],
+    [-0.0472664536120752, -0.8051769816585784, -0.5911479599644415, 835.0263791488059],
+    [0.0, 0.0, 0.0, 1.0]
+  ]
+}

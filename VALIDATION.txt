@@ -1,0 +1,16 @@
+Refactor validation summary
+Date: 2026-08-07
+
+- Pure Python tests: 156 passed, 11 subtests passed
+- Python compileall: passed
+- Python AST parse: passed
+- package.xml XML parse: passed
+- system.yaml YAML parse: passed
+- setuptools package discovery: passed
+- Stale legacy package import scan: no matches
+- Secret scan: no API key included; .env.example contains only replace_me
+
+Not run in the artifact-generation environment:
+- colcon build (ROS 2 / colcon unavailable)
+- RealSense runtime integration
+- Doosan M0609 / OnRobot RG2 hardware motion
