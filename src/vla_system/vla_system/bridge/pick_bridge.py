@@ -16,15 +16,11 @@ job is picking *which* class, not *where*.
 from dataclasses import dataclass
 import json
 
-# RobotAction.name values this bridge can actually forward. cobot2_ws's
-# pick_fsm always carries a pick through to place -- there is no "hold it and
-# wait" or "put it down right here" concept on that side (vla-bridge-
-# contract.md #7), so these two tools have nowhere to go. Rejected locally,
-# before anything is published, so cobot2_ws never even sees them.
-UNSUPPORTED_ACTIONS = {
-    "pick_and_hold": "cobot2_ws pick_fsm에는 '들고 대기'가 없습니다 (항상 place까지 진행됩니다)",
-    "release": "cobot2_ws pick_fsm에는 '제자리에 놓기'가 없습니다",
-}
+# agent/tools.py's MOTION_TOOLS is pick_and_place only now -- pick_and_hold
+# and release were removed there (cobot2_ws's pick_fsm always carries a pick
+# through to place, no "hold it and wait" or "put it down right here" on that
+# side, vla-bridge-contract.md #7), so this bridge no longer needs to reject
+# them; the model cannot produce them in the first place.
 
 # cobot2_ws's parse_command() treats "pick" and "pick_and_place" as synonyms;
 # using pick_and_place here keeps the JSON cmd matching the RobotAction.name
@@ -160,6 +156,58 @@ def bbox_center(scene_object) -> tuple[float, float]:
         (scene_object.x_min + scene_object.x_max) / 2.0,
         (scene_object.y_min + scene_object.y_max) / 2.0,
     )
+
+
+# --- Live FSM step visibility (docs/context/fsm-state-integration.md) --------
+#
+# cobot2_ws's pick_fsm already publishes /pick/state (std_msgs/String, bare
+# State enum name, every transition -- task_manager.py). This maps those names
+# onto RobotState so the GUI can show "지금 어느 단계인지". The name set below
+# mirrors pick_fsm/states.py's State enum; cobot2_ws owns the source (no shared
+# import across the two clones -- same hand-copy pattern as PLACE_VALUES).
+
+# States where the gripper physically holds the object (states.py HOLDING_STATES).
+FSM_HOLDING_STATES = frozenset({"VERIFY", "LIFT", "PLACE", "PLACE_RETRY"})
+
+# State name -> (RobotState.status, human label for RobotState.details).
+# Unlisted names fall through to ("moving", the raw name).
+_FSM_STATE_INFO = {
+    "IDLE": ("idle", "대기"),
+    "LISTENING": ("moving", "지시 듣는 중"),
+    "PERCEIVE": ("moving", "물체 인식 중"),
+    "SCENE_PREP": ("moving", "충돌 물체 등록 중"),
+    "PLAN": ("moving", "파지 계획 중"),
+    "NEXT_CANDIDATE": ("moving", "다음 후보 검토 중"),
+    "WAIT_APPROVAL": ("waiting_approval", "사람 승인 대기"),
+    "STOW": ("moving", "그리퍼 정리 중"),
+    "APPROACH": ("moving", "접근 중"),
+    "OPEN_GRIPPER": ("moving", "그리퍼 여는 중"),
+    "DESCEND": ("moving", "하강 중"),
+    "CLOSE": ("moving", "그리퍼 닫는 중"),
+    "VERIFY": ("holding", "파지 확인 중"),
+    "RELEASE_RETRY": ("moving", "놓치고 재시도 중"),
+    "LIFT": ("holding", "들어올리는 중"),
+    "PLACE": ("holding", "놓는 자세로 이동 중"),
+    "PLACE_RETRY": ("holding", "놓기 재시도 대기"),
+    "RELEASE": ("moving", "놓는 중"),
+    "HOME": ("moving", "홈 복귀 중"),
+    "SPEAK_FAIL": ("error", "실패 통보"),
+    "ABORT": ("moving", "중단 중"),
+    "SAFE_STOP": ("error", "정지 유지 (리셋 대기)"),
+}
+
+
+@dataclass(frozen=True)
+class FsmStateView:
+    status: str  # RobotState.status
+    label: str  # RobotState.details, human-readable step
+    holding: bool  # gripper holds the object in this state
+
+
+def fsm_state_view(state_name: str) -> FsmStateView:
+    """One /pick/state value -> how it should look in RobotState."""
+    status, label = _FSM_STATE_INFO.get(state_name, ("moving", state_name or "동작 중"))
+    return FsmStateView(status=status, label=label, holding=state_name in FSM_HOLDING_STATES)
 
 
 @dataclass(frozen=True)

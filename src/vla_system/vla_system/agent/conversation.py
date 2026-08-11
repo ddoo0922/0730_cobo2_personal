@@ -16,7 +16,16 @@ import json
 
 
 def scene_to_payload(scene, max_objects: int = 40) -> dict:
-    """Flatten a SceneSnapshot into the JSON the model reads."""
+    """Flatten a SceneSnapshot into the JSON the model reads.
+
+    Every visible object is reported ``pickable``: cobot2_ws's pick_fsm
+    computes the grasp coordinate on its own side from the object's class
+    name alone (bridge/pick_bridge.py -- only ``class`` crosses, never a
+    base-frame position), so this ws's own table calibration is not a
+    precondition for picking. ``position_base`` is still included when this
+    ws's perception happened to resolve one, purely as operator-facing
+    context (shown in vla_gui's debug panel) -- the model does not gate on it.
+    """
     if scene is None:
         return {"visible_objects": [], "note": "아직 카메라 장면을 받지 못했습니다."}
 
@@ -25,7 +34,7 @@ def scene_to_payload(scene, max_objects: int = 40) -> dict:
         entry = {
             "id": scene_object.id,
             "class": scene_object.class_name,
-            "pickable": bool(scene_object.position_valid),
+            "pickable": True,
         }
         if scene_object.color and scene_object.color != "unknown":
             entry["color"] = scene_object.color
@@ -37,12 +46,7 @@ def scene_to_payload(scene, max_objects: int = 40) -> dict:
             ]
         objects.append(entry)
 
-    payload = {"visible_objects": objects}
-    if not scene.calibration_ok:
-        payload["note"] = (
-            "테이블 보정이 없어 모든 물체의 좌표를 사용할 수 없습니다."
-        )
-    return payload
+    return {"visible_objects": objects}
 
 
 def robot_state_to_payload(state) -> dict:

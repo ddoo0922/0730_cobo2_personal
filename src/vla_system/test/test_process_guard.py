@@ -1,8 +1,8 @@
 """Leftover-pipeline cleanup: what gets signalled, how hard, and what is spared.
 
 The GUI runs this at every start, so a bug here either leaves a second
-`robot_node` alive on the same arm or kills something it had no business
-touching.
+`vla_pick_bridge_node` racing cobot2_ws's pick_fsm or kills something it had
+no business touching.
 """
 
 import os
@@ -15,6 +15,8 @@ import unittest
 
 from vla_system.process_guard import (
     EXISTING_PIPELINE_PATTERN,
+    PIPELINE_PATTERN,
+    REALSENSE_PATTERN,
     ancestor_pids,
     escalate_termination,
     parent_pid,
@@ -232,10 +234,15 @@ class PatternTest(unittest.TestCase):
 
     def test_the_pipeline_nodes_and_launch_are_matched(self):
         for command in (
-            "ros2 launch vla_system vla_system.launch.py motion_enabled:=false",
+            "ros2 launch vla_system vla_system.launch.py enable_pick_bridge:=true",
             "/usr/bin/python3 /x/install/vla_system/lib/vla_system/perception_node --ros-args",
             "/usr/bin/python3 /x/install/vla_system/lib/vla_system/agent_node",
-            "/usr/bin/python3 /x/install/vla_system/lib/vla_system/robot_node",
+            # Two of these would both publish/subscribe /vla/robot/action and
+            # /vla/pick_command, each handing cobot2_ws a different idea of
+            # what to pick (2026-08-11 -- this line was missing until a
+            # real-hardware session showed a manually-started
+            # vla_pick_bridge_node survived the GUI's own "leftover" cleanup).
+            "/usr/bin/python3 /x/install/vla_system/lib/vla_system/vla_pick_bridge_node",
             # Our launch file starts this one, and there is only one camera.
             "/opt/ros/humble/lib/realsense2_camera/realsense2_camera_node --ros-args",
         ):
@@ -265,6 +272,50 @@ class PatternTest(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertFalse(self.matches(command))
+
+
+class SplitPatternTest(unittest.TestCase):
+    """PIPELINE_PATTERN vs REALSENSE_PATTERN, split so the GUI can leave a
+    camera it does not own alone in cobot2_ws-integration mode (2026-08-11 --
+    a real-hardware session had the GUI kill a manually-started `reals1280`
+    camera and a manually-started pipeline it had no business touching, both
+    because `include_realsense` did not exist yet)."""
+
+    def test_realsense_pattern_matches_only_the_camera_node(self):
+        self.assertIsNotNone(
+            re.search(
+                REALSENSE_PATTERN,
+                "/opt/ros/humble/lib/realsense2_camera/realsense2_camera_node",
+            )
+        )
+        self.assertIsNone(re.search(REALSENSE_PATTERN, "ros2 launch vla_system vla_system.launch.py"))
+
+    def test_pipeline_pattern_alone_spares_the_camera(self):
+        """This is what `include_realsense=False` searches with -- a camera
+        the GUI did not start (someone's own launch/alias) must not appear."""
+        self.assertIsNone(
+            re.search(
+                PIPELINE_PATTERN,
+                "/opt/ros/humble/lib/realsense2_camera/realsense2_camera_node",
+            )
+        )
+
+    def test_pipeline_pattern_still_catches_the_launch_and_nodes(self):
+        for command in (
+            "ros2 launch vla_system vla_system.launch.py enable_pick_bridge:=true",
+            "/x/install/vla_system/lib/vla_system/perception_node",
+            "/x/install/vla_system/lib/vla_system/agent_node",
+            "/x/install/vla_system/lib/vla_system/vla_pick_bridge_node",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNotNone(re.search(PIPELINE_PATTERN, command))
+
+    def test_the_two_patterns_together_equal_the_combined_default(self):
+        """EXISTING_PIPELINE_PATTERN (include_realsense=True's search string)
+        must not silently drift from the two halves it is built from."""
+        self.assertEqual(
+            EXISTING_PIPELINE_PATTERN, f"{PIPELINE_PATTERN}|{REALSENSE_PATTERN}"
+        )
 
 
 if __name__ == "__main__":

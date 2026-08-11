@@ -30,6 +30,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -43,7 +44,12 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from vla_interfaces.msg import AgentReply, RobotState, SceneSnapshot
 
-from vla_system.process_guard import escalate_termination, find_existing_pipeline_pids
+from vla_system.process_guard import (
+    PIPELINE_PATTERN,
+    REALSENSE_PATTERN,
+    escalate_termination,
+    find_existing_pipeline_pids,
+)
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -52,18 +58,14 @@ from vla_system.process_guard import escalate_termination, find_existing_pipelin
 UTTERANCE_TOPIC = "/vla/user_utterance"
 ESTOP_TOPIC = "/vla/estop"
 ANNOTATED_IMAGE_TOPIC = "/vla/perception/annotated_image"
-# The RealSense rides on the wrist, so this view moves with the arm. It is not
-# what the agent reasons about -- it is there to watch the approach by eye.
-#
-# Prefer the annotated version, which draws what the wrist detector actually
-# found: "물체가 보이지 않습니다" is impossible to diagnose from a raw frame,
-# because it cannot distinguish an empty view from a detector that is pointed at
-# the object and not firing. Falls back to raw if vla_wrist is not running.
-WRIST_IMAGE_TOPIC = "/vla/wrist/annotated_image"
-WRIST_RAW_IMAGE_TOPIC = "/camera/camera/color/image_raw"
 SCENE_TOPIC = "/vla/scene"
 REPLY_TOPIC = "/vla/agent/reply"
 ROBOT_STATE_TOPIC = "/vla/robot/state"
+
+# cobot2_ws의 grasp_bridge_node가 기본으로 띄우는 viser 웹뷰어 (live_viz_port 기본값,
+# graspgenx_perception/grasp_bridge_node.py). ROS 토픽이 아니라 WebSocket/WebGL
+# 렌더러라 이 GUI에 임베드할 방법이 없다 -- 브라우저 새 창으로만 연다(2026-08-11).
+GRASPGENX_VIZ_URL = "http://localhost:8080"
 
 # Matched before anything else happens to the user's words. Deliberately broad:
 # a stop that fires when the user did not quite mean it costs one interrupted
@@ -188,12 +190,18 @@ def robot_state_line(state: dict | None) -> str:
         "idle": "대기",
         "moving": "동작 중",
         "holding": "물체를 든 채 대기",
+        "waiting_approval": "사람 승인 대기 ✋",
         "error": "오류",
     }.get(state["status"], state["status"])
     holding = state["holding_class"] or "없음"
     mode = "실제 모션" if state["motion_enabled"] else "DRY-RUN"
     tail = ""
-    if state["last_action"]:
+    if state.get("current_action") and state.get("details"):
+        # A pick is in flight -- details carries the live FSM step label
+        # (vla_pick_bridge fsm_state_callback), which is what the user wants to
+        # see instead of a bare "동작 중".
+        status = f"{status} · {state['details']}"
+    elif state["last_action"]:
         tail = f" | 최근: {state['last_action']} → {state['last_result']}"
     return f"{status} | 들고 있음: {holding} | {mode}{tail}"
 
@@ -213,8 +221,6 @@ class GuiRosBridge(Node):
 
         self._latest_frame: np.ndarray | None = None
         self._keep_frame: np.ndarray | None = None
-        self._latest_wrist_frame: np.ndarray | None = None
-        self._wrist_annotated_monotonic = 0.0
         self._latest_scene: dict | None = None
         self._latest_state: dict | None = None
 
@@ -249,12 +255,6 @@ class GuiRosBridge(Node):
             Image, ANNOTATED_IMAGE_TOPIC, self._image_callback, stream_qos
         )
         self.create_subscription(
-            Image, WRIST_IMAGE_TOPIC, self._wrist_image_callback, stream_qos
-        )
-        self.create_subscription(
-            Image, WRIST_RAW_IMAGE_TOPIC, self._wrist_raw_image_callback, stream_qos
-        )
-        self.create_subscription(
             SceneSnapshot, SCENE_TOPIC, self._scene_callback, stream_qos
         )
         self.create_subscription(
@@ -279,29 +279,6 @@ class GuiRosBridge(Node):
             self._keep_frame = frame
             self.frame_count += 1
             self.last_frame_monotonic = time.monotonic()
-
-    def _wrist_image_callback(self, message: Image) -> None:
-        try:
-            frame = ros_image_to_rgb(message)
-        except Exception as exc:
-            self.get_logger().warning(f"GUI wrist image decode failed: {exc}")
-            return
-        with self._lock:
-            self._latest_wrist_frame = frame
-            self._wrist_annotated_monotonic = time.monotonic()
-
-    def _wrist_raw_image_callback(self, message: Image) -> None:
-        """Raw fallback, used only while no annotated frame is arriving."""
-        with self._lock:
-            recent = time.monotonic() - self._wrist_annotated_monotonic < 2.0
-        if recent:
-            return
-        try:
-            frame = ros_image_to_rgb(message)
-        except Exception:
-            return
-        with self._lock:
-            self._latest_wrist_frame = frame
 
     def _scene_callback(self, message: SceneSnapshot) -> None:
         payload = {
@@ -367,12 +344,6 @@ class GuiRosBridge(Node):
             self._latest_frame = None
             return frame
 
-    def take_wrist_frame(self) -> np.ndarray | None:
-        with self._lock:
-            frame = self._latest_wrist_frame
-            self._latest_wrist_frame = None
-            return frame
-
     def snapshot(self) -> dict:
         with self._lock:
             return {
@@ -413,7 +384,6 @@ class VLAApp:
 
         self.pipeline_process: subprocess.Popen | None = None
         self.photo: tk.PhotoImage | None = None
-        self.wrist_photo: tk.PhotoImage | None = None
         self.clarify_photos: list[tk.PhotoImage] = []
 
         self.last_frame_count = 0
@@ -421,7 +391,6 @@ class VLAApp:
         self.current_fps = 0.0
         self.last_state_key: tuple | None = None
 
-        self.wrist_grasp_var = tk.BooleanVar(value=False)
         # 2026-08-11: 기본을 cobot2_ws 연동으로 바꿈 -- 이 GUI가 최종적으로 존재하는
         # 이유가 pick_fsm과 물려 돌리는 것이라, 단독 모드(vla_robot)가 예외가 되어야
         # 한다. 켜져 있으면 enable_pick_bridge:=true + enable_realsense:=false(카메라는
@@ -522,8 +491,6 @@ class VLAApp:
         # enable_robot:=true를 보낼 일이 아예 없어졌고, real_robot_var는 항상 False였다.
         # (기존 팀원 코드, 2026-08-11 사용자 승인 후 제거)
 
-        # Off by default: it loads a second YOLO plus GraspGenX (~1.2 GB VRAM)
-        # and is only useful with the RealSense actually mounted on the wrist.
         # 기본 켜짐: cobot2_ws pick_fsm이 카메라를 이미 잡고 있다는 전제로
         # enable_pick_bridge:=true + enable_realsense:=false를 함께 보낸다(README §4).
         # 이 ws 카메라로 단독 실행하려면 체크를 끈다 -- 그러면 enable_realsense:=true로
@@ -535,15 +502,18 @@ class VLAApp:
         )
         self.pick_bridge_check.grid(row=0, column=1, padx=(0, 8))
 
-        self.wrist_check = ttk.Checkbutton(
-            controls, text="손목 파지 (GraspGenX)", variable=self.wrist_grasp_var
+        # cobot2_ws 쪽 grasp_bridge_node가 띄우는 viser 웹뷰어는 ROS 이미지 토픽이
+        # 아니라 WebSocket 렌더러라 이 GUI 안에 못 그린다 -- 새 브라우저 창으로만
+        # 연다(2026-08-11, 사용자 확인).
+        self.viz_button = ttk.Button(
+            controls, text="GraspGenX 뷰어", command=self.open_graspgenx_viewer
         )
-        self.wrist_check.grid(row=0, column=2, padx=(0, 8))
+        self.viz_button.grid(row=0, column=3, padx=(0, 8))
 
         self.pipeline_button = ttk.Button(
             controls, text="VLA 시작", command=self.toggle_pipeline
         )
-        self.pipeline_button.grid(row=0, column=3)
+        self.pipeline_button.grid(row=0, column=4)
 
         # ------------------------------------------------- left: perception
 
@@ -551,11 +521,10 @@ class VLAApp:
         left.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
         left.columnconfigure(0, weight=1)
         left.rowconfigure(1, weight=4)
-        left.rowconfigure(4, weight=3)
-        left.rowconfigure(5, weight=2)
+        left.rowconfigure(3, weight=2)
 
         ttk.Label(
-            left, text="고정 Webcam / YOLO-seg  (LLM이 보는 화면)", style="Section.TLabel"
+            left, text="고정 RealSense / YOLO-seg  (LLM이 보는 화면)", style="Section.TLabel"
         ).grid(row=0, column=0, sticky="w")
         self.video_label = tk.Label(
             left,
@@ -571,22 +540,13 @@ class VLAApp:
             row=2, column=0, sticky="w", pady=(0, 5)
         )
 
-        ttk.Label(
-            left,
-            text="손목 RealSense + YOLO-seg  (파지용, 대화 판단에는 쓰이지 않음)",
-            style="Section.TLabel",
-        ).grid(row=3, column=0, sticky="w", pady=(4, 0))
-        self.wrist_label = tk.Label(
-            left,
-            text=f"{WRIST_IMAGE_TOPIC} 대기 중",
-            bg="#090a0c",
-            fg=MUTED,
-            bd=0,
-        )
-        self.wrist_label.grid(row=4, column=0, sticky="nsew", pady=(7, 8))
+        # 손목 RealSense 화면(예전 "손목 RealSense + YOLO-seg" 패널)과 GraspGenX
+        # 손목 파지 기능(wrist_grasp_node) 모두 제거됨 -- cobot2_ws의 pick_fsm이
+        # 유일한 실행 주체가 되면서 robot_node/wrist_grasp_node 스택 전체가
+        # 죽은 코드였다(CLAUDE.md #3).
 
         table_frame = ttk.Frame(left, style="Panel.TFrame")
-        table_frame.grid(row=5, column=0, sticky="nsew")
+        table_frame.grid(row=3, column=0, sticky="nsew")
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
 
@@ -745,6 +705,25 @@ class VLAApp:
         self.append_chat("system", f"정지 명령을 로봇에 즉시 전달했습니다. ({reason})")
         self.clear_clarification()
 
+    def open_graspgenx_viewer(self) -> None:
+        """cobot2_ws의 viser 뷰어를 새 브라우저 창으로 연다.
+
+        이 GUI 안에 임베드하지 않는 이유: viser는 WebSocket으로 브라우저에 접속시켜
+        클라이언트 쪽(three.js/WebGL)에서 그리는 구조라, sensor_msgs/Image 토픽처럼
+        받아서 tk.PhotoImage로 그릴 수 있는 정적 프레임이 아니다. cobot2_ws의
+        grasp_bridge_node/graspgen_worker가 이미 떠 있고 live_viz(기본 켜짐)일 때만
+        실제로 뭔가 보인다 -- 안 떠 있으면 브라우저가 연결 거부만 보여준다.
+        """
+        try:
+            webbrowser.open(GRASPGENX_VIZ_URL)
+            self.append_chat(
+                "system",
+                f"GraspGenX 뷰어를 새 창으로 열었습니다 ({GRASPGENX_VIZ_URL}). "
+                "cobot2_ws의 grasp_bridge_node가 안 떠 있으면 빈 화면/연결 실패만 보입니다.",
+            )
+        except Exception as exc:
+            self.append_chat("system", f"GraspGenX 뷰어를 열지 못했습니다: {exc}")
+
     # ------------------------------------------------------- clarification
 
     def clear_clarification(self) -> None:
@@ -899,21 +878,32 @@ class VLAApp:
         self.root.update_idletasks()
         time.sleep(seconds)
 
-    def _clear_leftover_pipeline(self) -> bool:
+    def _clear_leftover_pipeline(self, *, include_realsense: bool) -> bool:
         """Kill every leftover pipeline process before starting a new one.
 
-        Two `robot_node`s on one arm is what this prevents: each takes orders
-        from a different agent and they fight over the same hardware. Leftovers
+        Two `vla_pick_bridge_node`s racing cobot2_ws's pick_fsm is what this
+        prevents: each takes orders from a different agent and they fight
+        over /vla/pick_command. Leftovers
         are normal rather than exceptional -- closing or killing the GUI does not
         stop the `ros2 launch` it started, and a node that crashed out of a
         launch can outlive its siblings -- so this runs at every start instead of
         asking the user to go clean up in a terminal.
 
+        ``include_realsense`` must be False whenever this GUI's own launch will
+        pass ``enable_realsense:=false`` (cobot2_ws-integration mode, see
+        `start_pipeline`) -- otherwise this kills a RealSense process this run
+        never intended to touch, e.g. a camera the user started by hand
+        (`reals1280` alias) or cobot2_ws's own launch (2026-08-11, real-hardware
+        session: the GUI's leftover-cleanup was tearing down a manually-started
+        camera and the manually-started pipeline it was supposed to leave
+        alone).
+
         Returns False only when something refused to die, which is worth
         blocking on.
         """
 
-        leftover = find_existing_pipeline_pids()
+        pattern = f"{PIPELINE_PATTERN}|{REALSENSE_PATTERN}" if include_realsense else PIPELINE_PATTERN
+        leftover = find_existing_pipeline_pids(pattern)
         if not leftover:
             return True
 
@@ -940,8 +930,8 @@ class VLAApp:
             messagebox.showerror(
                 "프로세스 정리 실패",
                 f"다음 프로세스가 SIGKILL에도 종료되지 않았습니다:\n\n{detail}\n\n"
-                "이 상태로 시작하면 robot_node가 둘이 되어 같은 팔에 서로 다른 동작을 "
-                "동시에 보낼 수 있습니다.\n"
+                "이 상태로 시작하면 vla_pick_bridge_node가 둘이 되어 cobot2_ws에 서로 "
+                "다른 동작을 동시에 보낼 수 있습니다.\n"
                 "터미널에서 직접 확인한 뒤 다시 시도하세요.",
                 parent=self.root,
                 icon="error",
@@ -952,21 +942,23 @@ class VLAApp:
         return True
 
     def start_pipeline(self) -> None:
-        if not self._clear_leftover_pipeline():
+        # pick_bridge 켜짐(기본값) = 이 launch가 enable_realsense:=false로 뜬다 =
+        # 카메라는 남이 잡고 있다는 전제(cobot2_ws 쪽 launch나 사용자가 직접 켠
+        # reals1280 같은 별도 alias) -- 그 카메라 프로세스는 우리 소유가 아니니
+        # 정리 대상에서 뺀다. 이 판단이 leftover 정리보다 먼저 있어야 한다.
+        pick_bridge = bool(self.pick_bridge_var.get())
+        if not self._clear_leftover_pipeline(include_realsense=not pick_bridge):
             return
 
-        # enable_robot은 launch 기본값 false 그대로 -- GUI에서 실제 로봇 모션을 켜는
-        # 경로 자체가 없다(cobot2_ws pick_fsm이 전담, 위 "제거" 주석 참고). motion_enabled
-        # 인자도 그래서 안 보낸다: vla_robot 자체가 안 뜨니 값을 줘도 아무 효과가 없다.
-        wrist_grasp = bool(self.wrist_grasp_var.get())
-        pick_bridge = bool(self.pick_bridge_var.get())
+        # robot_node/wrist_grasp_node는 삭제됐다 -- 로봇 모션·손목 파지 모두
+        # cobot2_ws pick_fsm이 전담이라 이 launch에 enable_robot/enable_wrist_grasp
+        # 인자 자체가 더 이상 없다(CLAUDE.md #3).
         command = BASE_LAUNCH_COMMAND + [
             f"enable_pick_bridge:={'true' if pick_bridge else 'false'}",
             # pick_bridge 켜짐 = cobot2_ws 쪽 launch가 카메라를 이미 잡고 있다는 전제
             # (README §4) -- 여기서 또 열면 V4L2 충돌 위험. 꺼짐 = 이 ws 단독 실행이니
             # 이 ws가 카메라를 연다(예전 기본값).
             f"enable_realsense:={'false' if pick_bridge else 'true'}",
-            f"enable_wrist_grasp:={'true' if wrist_grasp else 'false'}",
         ]
         try:
             process = subprocess.Popen(
@@ -990,7 +982,6 @@ class VLAApp:
 
         self.pipeline_process = process
         self.pipeline_button.configure(text="VLA 정지")
-        self.wrist_check.configure(state="disabled")
         self.pick_bridge_check.configure(state="disabled")
         mode_note = (
             " cobot2_ws 연동(pick_bridge) ON -- 이 창의 '전송'/음성 발화가 곧 FSM"
@@ -1002,7 +993,6 @@ class VLAApp:
         self.append_chat(
             "system",
             f"VLA 파이프라인을 시작했습니다.{mode_note}"
-            f"{' 손목 파지 ON' if wrist_grasp else ''}"
             f"\n전체 로그: {PIPELINE_LOG_PATH}",
         )
         threading.Thread(
@@ -1072,7 +1062,6 @@ class VLAApp:
             pass
 
         self.pipeline_button.configure(text="VLA 시작")
-        self.wrist_check.configure(state="normal")
         self.pick_bridge_check.configure(state="normal")
         self.append_chat("system", "GUI가 시작한 VLA 파이프라인을 정지했습니다.")
 
@@ -1100,7 +1089,6 @@ class VLAApp:
             elif kind == "pipeline_exit":
                 self.pipeline_process = None
                 self.pipeline_button.configure(text="VLA 시작")
-                self.wrist_check.configure(state="normal")
                 self.pick_bridge_check.configure(state="normal")
                 self.append_chat("system", f"VLA launch 종료: returncode={payload}")
 
@@ -1146,16 +1134,6 @@ class VLAApp:
                 self.video_label.configure(image=self.photo, text="")
             except Exception as exc:
                 self.video_label.configure(image="", text=f"영상 표시 오류: {exc}")
-
-        wrist = self.bridge.take_wrist_frame()
-        if wrist is not None:
-            try:
-                max_w = max(240, self.wrist_label.winfo_width() - 4)
-                max_h = max(180, self.wrist_label.winfo_height() - 4)
-                self.wrist_photo = rgb_to_tk_photo(wrist, max_w, max_h)
-                self.wrist_label.configure(image=self.wrist_photo, text="")
-            except Exception as exc:
-                self.wrist_label.configure(image="", text=f"손목 영상 표시 오류: {exc}")
         self.root.after(33, self._refresh_video)
 
     def _refresh_status(self) -> None:
@@ -1244,6 +1222,21 @@ def main() -> None:
 
     root = tk.Tk()
     app = VLAApp(root, bridge, events)
+
+    # rclpy.init()이 이미 자체 SIGINT 핸들러를 심어놨다 -- Ctrl+C가 오면 rclpy
+    # 컨텍스트만 셧다운되고(spin 스레드가 ExternalShutdownException으로 죽음) Tk
+    # mainloop()는 그 사실을 모른다. 그 다음 Python 기본 KeyboardInterrupt가 한 번
+    # 더 올라오지만, Tkinter의 콜백 래퍼가 이걸 통째로 삼켜서(예외를 로그만 찍고
+    # 계속 진행) mainloop() 밖으로 안 나간다 -- 그래서 Ctrl+C를 여러 번 눌러도 창이
+    # 안 닫혔다(2026-08-11 확인). 여기서 SIGINT를 직접 잡아 우리 종료 경로
+    # (on_close: 파이프라인 서브프로세스 정리 + destroy)로 보낸다. after(0, ...)로
+    # 미루는 이유: 시그널 핸들러 자체는 다음 바이트코드 경계에서만 실행되므로,
+    # Tk 위젯 조작은 이미 안전한 시점인 메인 루프 콜백 안에서 하도록 넘긴다.
+    def _handle_sigint(_signum, _frame) -> None:
+        root.after(0, app.on_close)
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+
     try:
         root.mainloop()
     finally:

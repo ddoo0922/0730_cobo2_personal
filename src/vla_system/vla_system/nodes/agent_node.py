@@ -378,10 +378,6 @@ class AgentNode(Node):
                 )
             reason = self.speak(call)
 
-            if name == "release":
-                self.publish_action("release", "", reason)
-                return "들고 있던 물체를 놓는 중입니다. 완료되면 알려드리겠습니다.", True
-
             object_id = str(call.arguments.get("object_id", "")).strip()
             # Checked here rather than at the arm: a wrong id caught now costs
             # the model one extra tool round, whereas letting it through costs
@@ -393,13 +389,10 @@ class AgentNode(Node):
                     "있는 id 중에서 다시 고르세요.",
                     False,
                 )
-            if not scene_object.position_valid:
-                return (
-                    f"'{object_id}'는 아직 3D 위치를 확정하지 못해 집을 수 없습니다.",
-                    False,
-                )
-            # Only pick_and_place carries a destination -- pick_and_hold has no
-            # `place` in its schema (tools.py), so this is "" for that tool.
+            # No position_valid gate here: cobot2_ws's pick_fsm computes its
+            # own grasp coordinate from the class name alone
+            # (bridge/pick_bridge.py) and never sees position_base, so this
+            # ws's own table calibration is not a precondition for picking.
             place = str(call.arguments.get("place", "")).strip()
             self.publish_action(name, object_id, reason, place)
             return f"{object_id} 동작을 시작했습니다. 완료되면 알려드리겠습니다.", True

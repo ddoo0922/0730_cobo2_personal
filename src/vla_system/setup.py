@@ -25,8 +25,6 @@ setup(
         "console_scripts": [
             "perception_node = vla_system.nodes.perception_node:main",
             "agent_node = vla_system.nodes.agent_node:main",
-            "robot_node = vla_system.nodes.robot_node:main",
-            "wrist_grasp_node = vla_system.nodes.wrist_grasp_node:main",
             "vla_pick_bridge_node = vla_system.nodes.vla_pick_bridge_node:main",
             "table_homography_test = vla_system.nodes.table_homography_test_node:main",
             "vla_gui = vla_system.vla_gui:main",

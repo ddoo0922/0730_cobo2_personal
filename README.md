@@ -7,8 +7,14 @@ Doosan M0609 + OnRobot RG2 기준.
 Logitech C270가 아니라, 로봇 실행을 전담하는 `cobot2_ws`의 `pick_fsm`이 쓰는 것과
 **같은 물리 D435i**다(공유). `vla_perception`은 이제 그 카메라를 직접 열지 않고
 ROS 토픽(`image_topic`)을 구독한다 — 아래 "좌표가 어디서 오는가" 절이 현재 코드를
-그대로 설명한다. **손목 RealSense 구성은 아직 미정.** 상세·근거는
+그대로 설명한다. 상세·근거는
 [`docs/context/constraints.md`](docs/context/constraints.md) "카메라 구성" 참고.
+
+🔴 **로봇 실행은 이 ws에 없다 (2026-08-11).** `robot_node`(자체 모션/그리퍼
+제어)와 `wrist_grasp_node`(손목 RealSense + GraspGenX 정밀 파지)는 삭제됐다.
+이 ws는 **무엇을(class) 어디로(place) 집을지만 판단**해서 `cobot2_ws`의
+`pick_fsm`에 넘긴다 — 실제 모션·IK·충돌회피·그리퍼·정밀 그립 계산은 전부
+`cobot2_ws` 쪽 코드다.
 
 "사과는 네가 담을거야" → 로봇이 사과를 집어 담고, 담는 도중 "그 사과는 집지마" →
 지금 향하던 사과를 즉시 취소한다.
@@ -34,47 +40,44 @@ LLM이 결정한다. 규칙 매처(`matcher.py`), 대상 큐(`target_queue`),
 ```mermaid
 flowchart LR
     GUI[vla_gui<br/>텍스트/음성, 정지 키워드] -->|/vla/user_utterance| AG[vla_agent<br/>LLM 판단 + 대화 기억]
-    GUI -->|/vla/estop| RB[vla_robot<br/>moves.py 실행]
+    GUI -->|/vla/estop| PB[vla_pick_bridge]
     WC[고정 카메라<br/>D435i, cobot2_ws와 공유] --> PC[vla_perception<br/>YOLO-seg + table homography]
     PC -->|/vla/scene| AG
-    PC -->|/vla/scene| RB
     PC -->|annotated_image| GUI
-    RS[손목 RealSense] -->|color/image_raw| GUI
-    RS --> WR[vla_wrist<br/>YOLO-seg + hand-eye + GraspGenX]
-    RB -->|/vla/robot/tcp_pose| WR
-    RB -->|/vla/grasp/request| WR
-    WR -->|/vla/grasp/plan| RB
-    AG -->|/vla/robot/action| RB
-    AG -->|/vla/robot/stop| RB
+    AG -->|/vla/robot/action| PB
+    AG -->|/vla/robot/stop| PB
     AG -->|/vla/agent/reply| GUI
-    RB -->|/vla/robot/state| AG
-    RB -->|/vla/robot/state| GUI
-    RB -->|amovel / move_stop| HW[M0609 + RG2]
+    PB -->|/vla/pick_command| FSM["(다른 clone) cobot2_ws<br/>pick_fsm + grasp_bridge_node"]
+    FSM -->|/vla/pick_result| PB
+    PB -->|/vla/robot/state| AG
+    PB -->|/vla/robot/state| GUI
+    FSM -->|amovel / move_stop| HW[M0609 + RG2]
 ```
 
 | 노드 | 책임 | 판단하는가 |
 |---|---|---|
-| `vla_perception` | 고정 카메라 캡처, YOLO-seg 인스턴스 분할, IoU 추적, 마스크 색상, table homography로 base 좌표 | 아니오 (고정 로직) |
-| `vla_agent` | 결정 시점마다 LLM 호출, 대화 히스토리 유지, function calling | **예 (전부)** |
-| `vla_robot` | (단독 모드 전용, 기본 꺼짐) 액션을 실제 모션으로, 정지 경로 소유, 로봇 실제 상태 발행 | 아니오 (실행만) |
-| `vla_wrist` | 손목 RealSense YOLO-seg, hand-eye 변환, GraspGenX 6-DOF 파지 생성 | 아니오 (고정 로직) |
-| `vla_pick_bridge` | (cobot2_ws 연동 모드 전용, 기본 꺼짐) `RobotAction`→`/vla/pick_command` JSON 발행, `/vla/pick_result`→`RobotState` 역변환. `object_id`→`class` 변환이 핵심 | 아니오 (변환만) |
-| `vla_gui` | 입출력, STT, 정지 키워드 하드코딩, 되묻기 crop 표시, 손목 RealSense 화면 | 정지 키워드만 |
+| `vla_perception` | 고정 카메라 캡처, YOLO-seg 인스턴스 분할, IoU 추적, 마스크 색상, table homography로 base 좌표(GUI 표시용, 판단에는 안 씀) | 아니오 (고정 로직) |
+| `vla_agent` | 결정 시점마다 LLM 호출, 대화 히스토리 유지, function calling. class(물체)와 place(목적지)만 판단 — 좌표/모션은 판단하지 않음 | **예 (무엇을/어디로만)** |
+| `vla_pick_bridge` | 유일한 실행 경로. `RobotAction`→`/vla/pick_command` JSON 발행(`class`만 넘김, 좌표는 안 넘김), `/vla/pick_result`→`RobotState` 역변환 | 아니오 (변환만) |
+| `vla_gui` | 입출력, STT, 정지 키워드 하드코딩, 되묻기 crop 표시 | 정지 키워드만 |
 
-**두 실행 모드는 상호 배타적이다** — `vla_robot`과 `vla_pick_bridge`가 같은 토픽
-(`/vla/robot/action`, `/vla/robot/state`)을 놓고 경합하므로 동시에 켜지 않는다.
-자세한 건 아래 "실행" 절.
+🔴 **`robot_node`/`wrist_grasp_node`는 삭제됐다 (2026-08-11).** 실제 모션·IK·
+충돌회피·그리퍼·손목 카메라 기반 정밀 그립 계산은 전부 `cobot2_ws`의
+`pick_fsm`/`grasp_bridge_node`가 전담한다. 이 다이어그램의 `FSM` 박스가 다른
+git clone(`~/cobot2_ws`)의 별도 프로세스라는 뜻이다.
 
 ## LLM이 호출할 수 있는 함수
 
 | 함수 | 하는 일 |
 |---|---|
 | `pick_and_place(object_id, place, reason)` | 집어서 지정한 곳(`basket`/`table`/`discard`, 미언급 시 `basket`)에 놓는다 |
-| `pick_and_hold(object_id, reason)` | 집어서 든 채로 대기한다 |
-| `release()` | 들고 있는 물체를 현재 위치에 놓는다 |
 | `cancel_current_action()` | 진행 중인 동작을 즉시 중단한다 |
 | `ask_clarification(question, object_ids)` | 애매하면 추측하지 않고 되묻는다 |
 | `wait()` | 지금은 할 일 없음 |
+
+🔴 `pick_and_hold`/`release`는 삭제됐다(2026-08-11) — cobot2_ws의 `pick_fsm`은
+"쥔 채 대기"/"제자리에 놓기" 개념이 없어 항상 pick→place까지 진행하고, 이 둘의
+유일한 소비자였던 `robot_node`도 함께 삭제됐다.
 
 `object_ids`를 넘기면 GUI가 `annotated_image`에서 해당 물체들을 잘라
 번호를 붙여 보여주고, 사용자는 "1번"으로 답할 수 있다.
@@ -100,20 +103,18 @@ flowchart LR
 ```
 
 `robot_state`는 LLM의 기억보다 항상 우선한다. 대화 히스토리는 로봇의 "기억"이지만,
-실제로 무엇을 쥐고 있는지는 매번 `vla_robot`이 관측한 값으로 덮어쓴다.
+실제로 무엇을 쥐고 있는지는 매번 `vla_pick_bridge`가 cobot2_ws로부터 받은 값으로
+덮어쓴다(단, `/vla/pick_result`에는 holding 필드가 없어 `holding`은 이 경로에서
+항상 `null`이다 — cobot2_ws가 그 정보를 발행하기 전까지는 구조적 한계).
 
 ## 정지가 실제로 즉시 먹히는 이유
 
-기존 구조는 `movel`을 블로킹으로 순차 실행해서, "정지"가 들어와도 진행 중인
-`movel`이 끝날 때까지 반영되지 않았다. 지금은:
-
-1. 모든 긴 모션을 `amovel`/`amovej`(비블로킹)로 발행하고 `check_motion()`으로 폴링한다.
-   폴링 주기(`poll_interval_s`, 기본 20 ms)마다 취소 플래그를 확인한다.
-2. GUI가 "정지"를 로컬 정규식으로 잡아 `/vla/estop`을 즉시 발행한다.
+1. GUI가 "정지"를 로컬 정규식으로 잡아 `/vla/estop`을 즉시 발행한다.
    STT→LLM 왕복을 기다리지 않는다.
-3. `vla_robot`이 취소 플래그를 세우고 동시에 Doosan `motion/move_stop`
-   서비스를 `call_async`로 호출한다. 이 클라이언트는 `vla_robot` 자신의
-   executor 위에 있어서, 모션 워커 스레드가 Doosan API를 쓰고 있어도 충돌하지 않는다.
+2. `vla_pick_bridge`가 정지 시각을 기록하고, `cmd:"abort"`를 조건 없이
+   cobot2_ws로 발행한다(진행 중인 요청이 있든 없든 — "없으면 스킵"이 정지 경로가
+   해서는 안 되는 유일한 추측이기 때문). 실제 모션 중단은 cobot2_ws의 `pick_fsm`이
+   수행한다.
 
 ESC 키와 화면 우상단 **■ 정지** 버튼도 같은 경로다.
 
@@ -123,8 +124,9 @@ ESC 키와 화면 우상단 **■ 정지** 버튼도 같은 경로다.
 
 - `vla_agent`는 판단 시작 시점의 stop epoch을 기억하고, 동작을 발행하기 직전에
   epoch이 바뀌었으면 발행하지 않는다.
-- `vla_robot`은 `RobotAction.header.stamp`(판단을 *시작*한 시각)가 마지막 정지보다
-  이르면 거부한다. 에이전트가 정지를 듣기 전에 이미 메시지를 보냈더라도 막힌다.
+- `vla_pick_bridge`는 `RobotAction.header.stamp`(판단을 *시작*한 시각)가 마지막
+  정지보다 이르면 거부한다. 에이전트가 정지를 듣기 전에 이미 메시지를 보냈더라도
+  막힌다.
 
 ## 좌표가 어디서 오는가
 
@@ -140,130 +142,63 @@ ESC 키와 화면 우상단 **■ 정지** 버튼도 같은 경로다.
 깊이는 안 쓴다 — 아래 homography가 여전히 그 자리를 메운다(D435i 자체 depth로 넘어가는
 건 이번 변경 범위 밖).
 
+🔴 **2026-08-11부터 이 좌표는 실행에 안 쓰인다.** `vla_pick_bridge`는 `class`만
+cobot2_ws에 넘기고 좌표는 절대 넘기지 않는다 — 실제 그립 좌표는 cobot2_ws의
+`pick_fsm`이 자기 D435i로 직접 계산한다(`robot_node.py`/`table_homography.py`
+소비자가 삭제되면서 이 경로는 순수 정보용이 됐다). 아래는 `vla_perception`이 여전히
+계산은 하는 이유(GUI 디버그 패널 표시, ⚠ 보정 경고) 설명이다.
+
 카메라가 뭘 발행하든 이 노드가 쓰는 건 색상 프레임 한 장뿐이라 깊이가 없다. 그래서
 좌표는 `table_homography_test`로 측정한 테이블 보정에서 온다: 픽셀 → base XY, 그리고
 최소제곱으로 맞춘 테이블 평면에서 Z.
 
-여기에는 **물체가 보정한 테이블 위에 놓여 있다**는 가정이 하나 붙는다. 키가 있는
-물체의 마스크 중심은 그 물체의 윗면에 있으므로, 매핑은 "그 윗면이 테이블에 닿는다면
-어디일지"를 답한다 — 높이와 광축에서의 거리에 비례해 커지는 시차 오차다. 올바른
-물체로 팔을 보내기에는 충분하지만, 눈을 감고 손가락을 닫기에는 부족하다. 그것이
-나중에 손목 RealSense가 할 일이다.
-
 - 매핑하는 픽셀은 박스 중심이 아니라 **마스크 무게중심**이다. 기울어진 바나나나
   일부가 가려진 컵에서는 박스 중심이 물체 옆 테이블에 떨어질 수 있다.
-- 파지 Z는 `테이블 평면 + grasp_height_offset_m`이다. 로봇은 건네받은 Z에서 정확히
-  그리퍼를 닫으므로(`moves.py`의 `grasp = posx([x, y, z])`), 맨 테이블 Z를 주면
-  손가락이 테이블을 찍는다. 이 offset은 물체 높이의 무딘 대역이며, 조망 한 장에서는
-  높이를 측정할 수 없다.
+- 표시되는 Z는 `테이블 평면 + grasp_height_offset_m`이다(정보용 — 실제 그립 Z는
+  cobot2_ws가 독립적으로 계산한다).
 - 보정 사각형 **밖**의 물체는 좌표를 받지 못한다. 그 밖에서는 homography가
-  외삽이고 평면도 함께 외삽된다. 물체 자체는 장면에 남으므로 LLM은 "보인다"고
-  말할 수 있지만 집으러 가지는 못한다.
+  외삽이고 평면도 함께 외삽된다. 물체 자체는 장면에 남으므로 GUI 표시에는
+  뜨지만 좌표 칸은 비어 있다.
 
 보정은 **픽셀 좌표**라서 해상도가 바뀌면 전부 무의미해진다. 그래서 보정 JSON에
 `image_size`를 함께 저장하고, 구독한 첫 프레임의 해상도가 다르면 보정을 거부한다
 (`image_topic`을 발행하는 쪽 — 보통 `realsense2_camera`의 `color_profile` 인자 —
 해상도가 바뀌면 재보정 필요).
 
-## 두 카메라가 나누어 맡는 일
+## cobot2_ws 연동에서 카메라를 공유하는 방식
 
-고정 D435i(color만 사용)는 **무엇을 어디쯤**, 손목 RealSense는 **어떻게 잡을지**를
-답한다.
+🔴 **2026-08-11 확인**: cobot2_ws 연동 경로(§3/§4, GUI 기본값)에서는 물체 구분과
+GraspGenX가 **같은 물리 D435i 한 대**를 토픽으로 나눠 씁니다. 카메라를 여는
+프로세스(`realsense2_camera_node`)는 정확히 하나(cobot2_ws 쪽 launch 또는 사용자가
+직접 켠 alias — 예: `reals1280`)이고, 나머지는 전부 그 토픽의 구독자입니다:
 
-고정 카메라의 homography는 물체가 테이블 위에 있다고 가정하므로, 키가 있는 물체는
-상단면 시차만큼 좌표가 밀린다. 올바른 물체로 팔을 보내기엔 충분하지만 눈 감고
-손가락을 닫기엔 부족하다. 그래서 팔이 근처로 가는 동안부터 손목 카메라가 계속
-다시 본다.
+| 구독자 | 어디 | 하는 일 |
+|---|---|---|
+| `vla_perception`(이 ws) | M0609_VLA_system | `image_topic` 색상 프레임 구독 → YOLO-seg → LLM이 보는 장면 |
+| `yolo_seg_node` | cobot2_ws | 같은 색상 프레임 구독 → cobot2_ws 자체 세그멘테이션(mask/label 발행) |
+| `grasp_bridge_node`/`graspgen_worker` | cobot2_ws | depth + `yolo_seg_node`의 라벨 구독 → GraspGenX 6-DOF 파지 계산 |
 
-```
-손목에 목표 등록 (/vla/grasp/request)
-  → webcam 좌표 위 observe_height_m 높이로 이동하면서
-     RGB + aligned depth + 같은 시각의 TCP pose를 계속 동기화
-  → 손목 YOLO-seg: class/기준좌표가 연속 3프레임 일치
-  → 일치한 한 프레임의 마스크 점군으로 GraspGenX를 정확히 한 번 실행
-  → 정지 epoch 재확인
-  → pregrasp → grasp → 닫기
-```
+세 프로세스 다 `cv2.VideoCapture`나 장치 파일을 직접 열지 않습니다(`yolo_seg_node`의
+`acquire_singleton()`도 카메라가 아니라 **자기 출력 토픽**에 거는 잠금이라, 카메라
+자체는 여전히 다중 구독을 허용합니다) — 그래서 이 ws의 `vla_perception`이 옆에서
+같은 프레임을 봐도 장치 경합이 없습니다.
 
-### 동일 객체 판정
+**여기서 개체 지정(같은 클래스 물체가 2개 이상일 때 "어느 것")도 이미 연결돼 있습니다** —
+이 ws의 `vla_pick_bridge`가 보내는 `pixel`/`pixel_wh`(bbox 중심 픽셀, 재투영 없음)를
+cobot2_ws의 `grasp_bridge_node`가 `select_by_point()`로 실제로 소비하는 경로가
+**2026-08-11 cobot2_ws 쪽에서 구현 완료**됐습니다(`vla_command_node`의
+`pixel_policy` 파라미터: `warn`(기본, 무시하고 클래스만 사용)/`reject`/`select`).
+**단, 기본값은 여전히 `warn`이라 opt-in입니다** — cobot2_ws가
+`pixel_policy:=select`로 띄워야 실제로 픽셀 기반 개체 선정이 동작합니다. 이 ws
+쪽은 이미 픽셀을 보내고 있으니 추가 작업 없이 그 스위치만 켜면 됩니다.
 
-`class 일치 AND 수평거리 < match_tolerance_m`. **수평만** 비교한다 — webcam의 Z는
-테이블 평면 + `grasp_height_offset_m`이고 손목은 실제 표면을 재므로, 3D 거리로
-비교하면 정상 매칭도 전부 탈락한다. 같은 종류가 비슷하게 가까이 둘 있으면 추측하지
-않고 거부한다 (`refuse_ambiguous_match`).
-
-### GraspGenX 자세 규약 — 측정으로 확정한 것
-
-`onrobot_RG2`는 built-in으로 지원된다 (`type: revolute_2f`). 출력 4x4는 **그리퍼
-base** 기준이고, 실제 접촉점은 `원점 + R @ fingertip`이며 fingertip은 `[0,0,0.18]`,
-즉 **접근축은 local +Z**다. 릴리스 모델로 직접 재서 확인했다:
-
-| 측정 | 결과 |
-|---|---|
-| 자세 원점 → 물체 표면 | 중앙값 158.8 mm |
-| 원점 + R@fingertip → 표면 | 중앙값 4.3 mm |
-| fingertip 방향 · R의 3열 | 1.000000 |
-
-이걸 적용하지 않으면 모든 파지가 정확히 180 mm 빗나가는데, 로봇에서는 "캘리브레이션이
-나쁜 것"처럼 보여 원인을 찾기 어렵다.
-
-Doosan TCP(`GripperDA_v1`)는 손가락 끝에 있으므로 명령하는 것은 **접촉점**이다.
-
-### TCP가 반드시 일치해야 하는 이유
-
-hand-eye 보정은 `set_tcp("GripperDA_v1")` 상태에서 기록됐다. `get_current_posx()`는
-컨트롤러에 현재 걸린 TCP를 반환하므로, 런타임에 다른 TCP가 걸려 있으면
-`base2gripper @ T_camera→gripper` 전체가 무의미해진다. 그래서 `vla_robot`이 기동 시
-`set_tool`/`set_tcp`를 명시적으로 설정하고, `vla_wrist`는 로봇이 보고한 TCP 이름이
-`expected_tcp_name`과 다르면 좌표 변환과 파지 계획을 거부한다.
-
-이동 중에는 영상 한 장과 현재 pose 한 장을 임의로 섞지 않는다. `vla_robot`이 활성
-요청 ID를 붙여 선택된 TCP를 10 Hz로 읽고(서비스 왕복 시각의 중간값으로 stamp),
-`vla_wrist`가 요청 이후의 같은-stamp RGB/depth와 영상 전후로 bracket된 가장 가까운
-TCP 샘플만 사용한다. 한 프레임에서 YOLO가 비어도 즉시 실패하지 않고 다음 프레임을
-계속 관찰한다.
-
-### 관찰 자세와 실제 도달 확인
-
-`amovel` 서비스의 `success=true`는 명령 접수일 뿐이다. M0609가 그 직후 1206
-`NOT REACHABLE`을 내면 `check_motion()`은 처음부터 계속 IDLE일 수 있다. 따라서 모든
-Cartesian/관절 모션은 종료 뒤 실제 TCP/관절을 목표와 비교하며, 도달하지 않은 팔로
-파지나 그리퍼 닫기를 이어가지 않는다.
-
-관찰 자세는 먼저 기존처럼 TCP를 webcam 좌표 위에 둔다. IK→FK 왕복 검증에서 얻은 관절
-해를 그대로 실행해서, 경계 근사 관절 해를 검증해 놓고 별도의 정확한 Cartesian 목표를
-보내 `NOT REACHABLE`이 되는 판정·실행 불일치를 없앤다. 그 자세가 왕복 검증에 실패하면
-`T_gripper2camera.npy`의 측면 장착 오프셋을 이용한다. 카메라가 바깥을 향하도록 top-down
-yaw를 돌리고 카메라 시점을 객체보다 최대 140 mm 안쪽에 두어, 객체는 D435 화면 안에
-유지하면서 TCP는 로봇의 도달 영역 안으로 당긴다. 직접/대체 자세 모두 optical axis가
-아래쪽 10° 안에 있을 때만 허용하고, 먼저 TCP를 base Z 280 mm까지 수직 상승시킨 뒤 검증된
-현재 solution-space 관절 해로 이동한다. 최종 TCP와 관절도 실제 도달을 다시 확인한다.
-
-### 계획 중 정지
-
-GraspGenX 추론은 약 1.6초다. 그 사이 "정지"가 들어오면, 정지 *이전*의 세계관으로
-만들어진 파지가 정지 *이후*에 실행될 수 있다. `vla_robot`은 계획을 요청한 시각을
-기억하고 실행 직전에 stop epoch을 다시 확인한다 — 에이전트가 LLM 왕복에 대해 주는
-보장과 같은 것이다. 폴링 주기도 `poll_interval_s`라서 정지 반응 지연의 상한이
-다른 모션과 동일하다.
-
-### 실측 비용 (RTX 4060 Laptop 8 GB)
-
-| 항목 | 값 |
-|---|---|
-| GraspGenX VRAM 피크 | 1163 MB |
-| 추론 | 약 1.6 s / 물체 |
-| 모델 로드 | 약 15 s (1회) |
-
-YOLO-seg 두 개(webcam + 손목)와 함께 8 GB 안에 들어간다.
-
-### 파지가 실패할 때
-
-손목이 계획을 못 내면 (물체가 프레임 밖, depth 구멍, 필터에 전부 걸림)
-`wrist_grasp_fallback`이 true면 기존 webcam 좌표 파지로 되돌아간다. false면 동작이
-`failed`로 끝난다. 단, 관찰/접근 모션 자체가 도달하지 못한 경우는 카메라 계획 실패가
-아니므로 fallback하지 않고 즉시 `failed`로 끝낸다. 손목 경로 자체를 끄려면
-`use_wrist_grasp: false`.
+🔴 **손목 RealSense/GraspGenX 정밀 파지 경로는 2026-08-11 이 ws에서 완전히
+삭제됐다** (`wrist_grasp_node.py`, `grasp/*`, `perception/wrist_geometry.py`,
+`perception/wrist_tracking.py` — CLAUDE.md #3). 예전에는 여기서 "동일 객체 판정",
+"GraspGenX 자세 규약", "TCP 일치", "관찰 자세", "실측 비용" 같은 상세 설계를
+다뤘지만, 그 코드와 함께 삭제했다 — 필요하면 git 히스토리에 남아 있다. 정밀 파지
+계산은 이제 cobot2_ws의 `grasp_bridge_node`/`graspgen_worker`가 전담한다(위
+"cobot2_ws 연동에서 카메라를 공유하는 방식" 참고).
 
 ## 시작할 때 찌꺼기를 먼저 정리하는 이유
 
@@ -271,7 +206,8 @@ YOLO-seg 두 개(webcam + 손목)와 함께 8 GB 안에 들어간다.
 
 GUI를 닫거나 죽여도 그것이 띄운 `ros2 launch`는 살아남는다 — OS 차원의 부모-자식
 종료 연결이 없기 때문이다. 그래서 새 GUI는 이전 실행을 기억하지 못하고, 그대로
-시작하면 `robot_node`가 둘이 되어 같은 팔에 서로 다른 동작을 동시에 보낸다.
+시작하면 `vla_pick_bridge_node`가 둘이 되어 cobot2_ws에 서로 다른 동작을 동시에
+보낸다.
 launch에서 노드 하나만 죽어 형제들보다 오래 남는 경우도 있다. 찌꺼기는 예외가
 아니라 정상 상황이라서, 사용자에게 터미널에서 정리하라고 요구하지 않고 매번
 자동으로 처리한다.
@@ -287,6 +223,13 @@ launch에서 노드 하나만 죽어 형제들보다 오래 남는 경우도 있
   호출자가 사라진다.
 - 좀비는 살아있는 것으로 세지 않는다. `os.kill(pid, 0)`은 좀비에도 성공하므로,
   신호만으로는 자기가 방금 죽인 자식의 사망을 확인할 수 없다.
+- 🔴 **RealSense 카메라 프로세스는 조건부로만 정리한다(2026-08-11 수정)**. cobot2_ws
+  연동 모드(`enable_realsense:=false`로 뜨는 launch)에서는 카메라를 남이 잡고
+  있다는 전제라 정리 대상에서 뺀다 — 안 뺐더니 실기 세션에서 사용자가 직접 켠
+  카메라(`reals1280` alias)를 GUI가 "leftover"로 오인해 죽인 사고가 있었다. 단독
+  모드(이 ws가 직접 `enable_realsense:=true`로 카메라를 열 때)는 예전처럼 정리
+  대상에 포함한다 — 두 RealSense 노드는 절대 공존할 수 없다는 원래 이유는 그대로
+  유효하다. `_clear_leftover_pipeline(include_realsense=...)`.
 
 로직은 `vla_system/process_guard.py`에 있다 — tkinter도 ROS도 없이 테스트할 수
 있도록 GUI에서 분리했다.
@@ -363,10 +306,13 @@ nano .env          # OPENAI_API_KEY=...
 
 ## 실행
 
-### 1. 로봇 없이 (DRY-RUN)
+### 1. GUI로 시작
 
-`vla_robot`이 좌표와 작업공간을 검증하고 동작 시간만 흉내 낸다. 실제 팔은 움직이지
-않는다. 대화 흐름, 되묻기, 정지 경로를 전부 이 상태에서 검증할 수 있다.
+`vla_robot`(DRY-RUN 모션 시뮬레이션)은 삭제됐다 — 로봇을 흉내 낼 필요 없이,
+cobot2_ws의 `pick_fsm`을 안 띄운 채로 "cobot2_ws FSM 연동" 체크를 꺼두면
+`vla_pick_bridge_node`도 안 뜨고 아무것도 실행되지 않는다. 대화 흐름, 되묻기,
+정지 경로, 물체 인식만 이 상태로 검증할 수 있다(동작 명령은 발행되지만 받는
+쪽이 없어 그냥 사라진다).
 
 ```bash
 source scripts/env.sh
@@ -381,53 +327,39 @@ launch가 이미 잡고 있다는 전제, 아래 §3/§4)를 같이 보낸다. �
 혼자 돌리고 싶을 때만(예: cobot2_ws 없이 대화·인식 로직만 테스트) 체크를 끈다 — 그
 러면 예전 기본값(`enable_realsense:=true`, pick_bridge 꺼짐)으로 돌아간다.
 
+화면 상단 "GraspGenX 뷰어" 버튼은 cobot2_ws의 `grasp_bridge_node`가 기본으로
+띄우는 viser 웹뷰어(`http://localhost:8080`)를 새 브라우저 창으로 연다 — ROS
+이미지 토픽이 아니라 WebSocket/WebGL 렌더러라 GUI 안에는 못 그린다(2026-08-11).
+cobot2_ws의 GraspGenX가 안 떠 있으면 빈 화면/연결 실패만 보인다.
+
+🔴 **Ctrl+C가 안 먹으면(창이 안 닫히면)**: `rclpy.init()`이 심어둔 SIGINT
+핸들러와 Tkinter의 콜백 예외 처리가 겹쳐서 예전엔 실제로 안 닫히는 경우가
+있었다 — `main()`에 별도 SIGINT 핸들러를 달아 고쳤다(2026-08-11). 여전히 안
+닫히면 버그이니 보고할 것.
+
 터미널에서 직접 띄우고 싶으면(GUI 없이):
 
 ```bash
 ros2 launch vla_system vla_system.launch.py enable_realsense:=false
 ```
 
-손목 파지를 쓰려면 명시적으로 켠다 (두 번째 YOLO + GraspGenX를 올리므로 기본 꺼짐):
+### 2. 실제 로봇 — 🔴 이 ws에서 완전히 삭제됨 (2026-08-11)
 
-```bash
-ros2 launch vla_system vla_system.launch.py enable_wrist_grasp:=true
-```
+**`robot_node.py`/`robot/gripper.py`/`robot/moves.py`와, 손목 카메라로 정밀
+그립 포즈를 계산하던 `wrist_grasp_node.py`/`grasp/*`/`perception/wrist_*.py`는
+전부 삭제됐다.** cobot2_ws와의 역할 분담을 명확히 하기 위한 결정(CLAUDE.md §3) —
+로봇 실행(모션·IK·충돌회피·그리퍼)과 정밀 그립 계산은 처음부터 끝까지
+`cobot2_ws`의 `pick_fsm`/`grasp_bridge_node`가 전담한다. 이 ws는 `class`(물체
+이름)와 `place`(목적지)만 판단해서 `/vla/pick_command`로 넘긴다 — 좌표 계산도,
+모션도, 그립도 이 ws의 코드에는 더 이상 없다.
 
-### 2. 실제 로봇 — 🔴 이 노드에서는 비활성화됨 (2026-08-10)
+`enable_robot`/`enable_wrist_grasp`/`motion_enabled` launch 인자는 더 이상
+존재하지 않는다 — `vla_system.launch.py`에 그 노드들이 없다. `ros2 launch`는
+선언 안 된 인자를 넘겨도 에러 없이 조용히 무시하므로(2026-08-11 직접 확인)
+`enable_robot:=false`를 계속 붙여도 무해하지만, 아무 효과가 없으니 빼는 게
+맞다.
 
-**`vla_robot`(`robot_node`)과 `robot/gripper.py`는 기본적으로 뜨지 않는다.** 로봇
-실행(모션·IK·충돌회피·그리퍼)은 `cobot2_ws`의 `pick_fsm`이 전담한다 — 감지·행동
-지시는 `cobot2_ws/md/plans/2026-08-08-vla-integration.md`가 정하는 JSON 경계
-(`/vla/pick_command` ↔ `/vla/pick_result`)를 통해 그쪽 FSM으로 넘어간다(브리지
-`vla_pick_bridge`는 같은 문서 §9-5-2, 아직 미착수).
-
-`vla_system.launch.py`는 이제 `enable_robot:=false`가 기본값이라 `vla_robot`이
-아예 안 뜬다. 예전처럼 `motion_enabled:=true`만 주면 실제 로봇이 움직일 거라
-기대하지 말 것 — 노드 자체가 없다.
-
-```bash
-# vla_robot/gripper.py를 이 노드 단독으로(= cobot2_ws pick_fsm이 안 떠 있을 때만) 테스트하려면
-ros2 launch vla_system vla_system.launch.py enable_robot:=true motion_enabled:=true
-```
-
-🔴 **`cobot2_ws`의 `pick_fsm`이 로봇을 잡고 있는 동안 위 명령을 켜지 말 것.**
-`vla_robot`의 `DSR_ROBOT2`(`amovel`)와 `pick_fsm`의 `dsr_moveit_controller`가
-**같은 DRFL TCP 연결**을 공유하고, `robot/gripper.py`(pymodbus 직결)는 `pick_fsm`
-쪽 `OnRobotRGControllerServer`와 **같은 Modbus 레지스터**에 동시에 쓴다 — 둘 다
-ROS 레벨이 아니라 장비 레벨 충돌이라 에러 없이 조용히 오동작할 수 있다.
-
-실기로 되돌릴 때 `src/vla_system/config/system.yaml`에서 확인할 것(참고용, 지금은
-이 경로로 실행하지 않는다):
-
-- 테이블 보정(`~/.ros/vla_table_homography.json`)이 현재 카메라 설치와 테이블
-  위치에 맞는가. 카메라나 테이블을 건드렸으면 다시 측정해야 한다
-  (없거나 못 읽으면 GUI 상단에 ⚠ 표시가 뜨고 모든 물체가 "집기 가능 X"가 된다)
-- `grasp_height_offset_m`이 집을 물체 높이에 맞는가
-- `workspace_*_m`가 실제 안전 작업공간보다 작게 설정됐는가
-- `place_joints`가 충돌 없는 위치인가
-- RG2 IP/포트/힘이 실제 장비와 일치하는가
-
-### 3. cobot2_ws 연동 — `vla_pick_bridge` (2026-08-10 추가, MVP)
+### 3. cobot2_ws 연동 — `vla_pick_bridge` (2026-08-10 추가, 2026-08-11 유일한 실행 경로로 확정)
 
 실제 로봇 실행은 `cobot2_ws`의 `pick_fsm`이 전담한다(위 2절). 이 ws가 할 일은 LLM이
 결정한 `object_id`를 `class`로 바꿔 `/vla/pick_command`(JSON)로 cobot2_ws에 넘기고,
@@ -442,9 +374,9 @@ GUI로 켜면 이 인자를 직접 넘길 필요 없다 — "cobot2_ws FSM 연�
 기본 켜짐이라 **GUI + VLA 시작 버튼 한 번**이 위 launch와 같은 조합
 (`enable_pick_bridge:=true enable_realsense:=false`)을 대신 실행한다(위 1절).
 
-🔴 **`enable_robot:=true`와 절대 같이 켜지 않는다** — 둘 다 `/vla/robot/action`을
-구독하고 `/vla/robot/state`를 발행해서 경합한다. `vla_pick_bridge`는 기본값이
-`false`다(GUI에서 이 인자를 켜는 경로 자체가 없으니 GUI로는 이 문제가 안 생긴다).
+🔴 **`vla_pick_bridge_node`를 두 개 띄우지 않는다** — 둘 다 `/vla/robot/action`을
+구독하고 `/vla/robot/state`를 발행해서 경합한다(GUI는 매 시작마다 leftover
+프로세스를 정리해 이 문제를 피한다, `process_guard.py`).
 
 🔴 **이걸로 "UI + launch 하나"까지는 맞지만, 그것만으로 FSM이 자동으로 돌지는
 않는다** — 바로 아래 항목 참고.
@@ -485,8 +417,12 @@ cobot2_ws 세션에서 `auto_start:=true` + `vla_pick_bridge`를 같이 띄워 �
   `table`/`discard`는 cobot2_ws 쪽 teach가 아직 안 끝나(placeholder 관절값,
   `vla-bridge-contract.md` §5) `vla_pick_bridge`의 `allow_unverified_place`(기본
   `false`)가 막아둔다 — teach 끝나면 그 파라미터만 뒤집으면 된다.
-- 같은 클래스 물체가 2개 이상이면 "1번"으로 되물어도 cobot2_ws가 아무 물체나 집을
-  수 있다 — `class`만 경계를 넘고 개체 단위 좌표(`pixel`)는 아직 안 쓴다.
+- 🔴 **2026-08-11 갱신**: `pixel`/`pixel_wh`은 이제 보낸다(위 "cobot2_ws 연동에서
+  카메라를 공유하는 방식" 참고). cobot2_ws의 `select_by_point()`도 구현 완료됐지만
+  **기본은 여전히 무시(`pixel_policy=warn`)** — cobot2_ws가 `pixel_policy:=select`로
+  띄우지 않는 한 같은 클래스 물체가 2개 이상이면 "1번"으로 되물어도 여전히 아무
+  물체나 집을 수 있다. 이 조합(이 ws pixel 전송 + cobot2_ws `select`)의 실기 왕복은
+  아직 검증 안 함.
 - `allowed_classes`(cobot2_ws가 인식하는 클래스 목록)와 이 ws YOLO의
   `target_classes`가 이름 단위로 안 맞으면 일부 클래스는 즉시 거부된다. 두 YOLO를
   맞출지는 아직 미정 — 지금은 손대지 않았다.
@@ -503,13 +439,10 @@ source scripts/env.sh
 DOOSAN_SETUP=~/cobot2_ws/install/setup.bash ./scripts/build.sh   # 코드를 고쳤을 때만
 ros2 launch vla_system vla_system.launch.py \
   enable_realsense:=false \
-  enable_robot:=false \
   enable_pick_bridge:=true
 ```
 
 - `enable_realsense:=false` — RealSense는 다른 launch가 띄운다. 여기서 또 켜면 안 됨.
-- `enable_robot:=false` — 로봇 실행은 cobot2_ws `pick_fsm`이 전담. 켜면 `vla_pick_bridge`와
-  `/vla/robot/action`·`/vla/robot/state`를 놓고 경합한다(절대 동시에 켜지 않음).
 - `enable_pick_bridge:=true` — `object_id`→`class` 변환 후 `/vla/pick_command`로
   cobot2_ws에 넘기고 `/vla/pick_result`를 되돌리는 역할.
 - `ROS_DOMAIN_ID`를 cobot2_ws 쪽과 반드시 맞춘다(기본값이 서로 다르다) — 아래 "검증
@@ -536,10 +469,6 @@ DOOSAN_SETUP 기본값(`~/cobot_ws/install/setup.bash`)은 이 머신에 없다 
 | `vla_agent.max_tool_rounds` | 한 결정 안에서 허용하는 tool 왕복 수 |
 | `vla_agent.max_history_items` | 이 개수를 넘으면 오래된 턴부터 통째로 버린다 |
 | `vla_agent.max_consecutive_failures` | 연속 실패가 이만큼이면 자동 진행을 멈추고 사용자에게 묻는다 |
-| `vla_robot.motion_enabled` | 실제 모션 스위치. 기본 false |
-| `vla_robot.stop_mode` | MoveStop 모드. 0=QSTOP_STO, 1=QSTOP, 2=SSTOP, 3=HOLD |
-| `vla_robot.poll_interval_s` | 정지 반응 지연의 상한 |
-| `vla_robot.max_scene_age_s` | 이보다 오래된 장면으로는 집으러 가지 않는다 |
 | `vla_perception.backend` / `device` | `pytorch` + `cuda:0` (기본) 또는 `openvino` + `intel:gpu` |
 | `vla_perception.image_topic` | 고정 D435i color 토픽. 기본 `/camera/camera/color/image_raw` — `realsense2_camera`가 발행하는 것과 같아야 한다 |
 | `vla_perception.max_image_age_s` | 이보다 오래된 카메라 프레임은 버린다 (기본 2.0s) |
@@ -547,17 +476,15 @@ DOOSAN_SETUP 기본값(`~/cobot_ws/install/setup.bash`)은 이 머신에 없다 
 | `vla_perception.grasp_height_offset_m` | 테이블 높이에 더해 파지 Z를 만든다 (기본 0.02) |
 | `vla_perception.require_inside_table` | 보정 사각형 밖 물체는 좌표를 주지 않는다 (기본 true) |
 | `vla_perception.use_masks` | 색상 판정과 테이블에 매핑할 픽셀을 마스크 안쪽으로 제한한다 (기본 true) |
-| `vla_robot.dry_run_motion_s` | DRY-RUN에서 모션 한 구간이 걸리는 시간. 말로 끼어들어 테스트하려면 늘린다 |
 | `vla_pick_bridge.pick_command_topic` / `pick_result_topic` | cobot2_ws `vla_command_node`와 맞닿는 JSON 토픽. 기본값이 그쪽 기본값과 일치해야 한다 |
 | `vla_pick_bridge.result_timeout_s` | cobot2_ws가 이 시간 안에 결과를 안 주면 `failed`로 포기한다 (기본 60s, cobot2_ws의 `wait_timeout_sec` 50s보다 여유 있게) |
 | `vla_pick_bridge.allow_unverified_place` | `place=table/discard`를 실제로 보낼지 (기본 `false`). cobot2_ws의 teach가 끝나기 전까지 켜지 않는다 |
 
 좌표 단위 계약:
 
-- `SceneObject.position_base`, workspace 파라미터: **m**
+- `SceneObject.position_base`: **m** (GUI 표시용, 실행에는 안 쓰인다)
 - `table_homography.py`의 모든 공개 함수와 보정 JSON: **mm** (Doosan API와 맞춤).
   `table_point_from_pixel()`이 유일한 mm→m 경계다
-- Doosan `posx`: `moves.py` 내부에서만 mm로 변환
 
 ## 테스트
 
@@ -568,26 +495,35 @@ python3 -m pip install -r requirements-dev.txt
 ./scripts/check.sh
 ```
 
-🔴 **ROS를 먼저 소싱해야 한다** (2026-08-10 실측 정정 — 예전엔 "ROS도 카메라도
-로봇도 필요 없다"였는데 지금은 아니다). `test_wrist_async_state.py`가
-`vla_interfaces`(빌드 산출물)를 import하므로 `install/setup.bash`가 없으면
-collection 자체가 실패한다. 나머지 테스트는 여전히 순수 로직만 다룬다 — ROS
-런타임(노드 기동)이나 카메라·로봇은 필요 없다, `vla_interfaces`가 PYTHONPATH에
-잡히기만 하면 된다.
+🔴 **ROS 코어(`/opt/ros/humble/setup.bash`)는 여전히 소싱해야 한다** — pytest의
+`launch_testing` 플러그인 훅이 collection 시점에 이를 요구한다. 2026-08-11
+`wrist_grasp_node`를 쓰던 `test_wrist_async_state.py`(유일하게 `vla_interfaces`
+빌드 산출물을 import하던 테스트)를 삭제하면서, `install/setup.bash`(패키지 빌드)
+소싱은 더 이상 필요 없다 — 나머지 테스트는 전부 순수 로직만 다룬다.
 
 ```text
-271 passed
-XML/YAML validation passed
+132 passed
 ```
 
 커버 범위: 대화 히스토리 트리밍(고아 tool 출력 방지), scene/robot_state 직렬화,
-작업공간 경계, 취소 전파와 파지 시점 보고, object handle 정규화, IoU 추적 동일성,
-tool 스키마 strict 규약, 클래스 필터링 후 box↔mask 인덱스 정합, HSV 7색 밴드와
-마스크 색상 판정, table homography 좌표(mm→m 경계, 보정 사각형 밖 거부, 해상도
-불일치 거부, 손상된 보정 파일 거부), 잔여 프로세스 정리(신호 단계 상승, 좀비 판정,
-조상 프로세스 보호), `vla_pick_bridge`의 JSON 빌드·result 매핑·object_id→class 조회.
+object handle 정규화, IoU 추적 동일성, tool 스키마 strict 규약, 클래스 필터링 후
+box↔mask 인덱스 정합, HSV 7색 밴드와 마스크 색상 판정, table homography 좌표
+(mm→m 경계, 보정 사각형 밖 거부, 해상도 불일치 거부, 손상된 보정 파일 거부),
+잔여 프로세스 정리(신호 단계 상승, 좀비 판정, 조상 프로세스 보호),
+`vla_pick_bridge`의 JSON 빌드·result 매핑·object_id→class 조회.
 
-### 실제 ROS 런타임에서 확인한 것
+🔴 작업공간 경계·정지 중 파지 상태 보고 등 `robot_node.py`/`grasp/poses.py`
+전용 테스트는 그 코드와 함께 삭제됐다(2026-08-11) — 그 안전장치는 이제 이 ws가
+아니라 cobot2_ws `pick_fsm` 쪽 코드의 책임이다.
+
+### 실제 ROS 런타임에서 확인한 것 (2026-08-10, 이후 삭제된 `vla_robot` 기준 — 기록용)
+
+🔴 아래 표는 `robot_node.py`(DRY-RUN 모션 시뮬레이션)가 아직 있던 시점의 검증
+기록이다. 그 노드는 2026-08-11 삭제됐고, `pick_and_hold`/`release`도 스키마에서
+빠졌다 — `release`/`위치 미확정` 행은 지금 아키텍처에는 더 이상 해당하지 않는다.
+현재 유효한 것: 모호한 지시·되묻기·정지 경로는 `vla_agent`가 그대로 담당하므로
+행 대부분은 지금도 같은 의미다. 새 검증은 `vla_pick_bridge`↔cobot2_ws 실기
+왕복(§4 "남은 것")으로 대체됐다.
 
 `colcon build` 후 DRY-RUN으로 세 노드를 실제로 띄워 확인했다 (로봇·카메라 없이,
 장면은 가짜 publisher로 주입).
@@ -605,8 +541,8 @@ tool 스키마 strict 규약, 클래스 필터링 후 box↔mask 인덱스 정�
 | 실행 중 두 번째 동작 도착 | 큐에 쌓지 않고 `rejected`, 진행 중 동작은 그대로 완료 |
 
 별개로, **로봇/그리퍼를 뺀 나머지 노드가 전부 뜨는지**(colcon build, `perception_node`
-단독, `vla_system.launch.py` 통합, `wrist_grasp_node`, `vla_gui` 창 실제로 뜨는지,
-`vla_pick_bridge` 왕복 스모크)는 2026-08-10에 별도로 점검했다 — 결과는
+단독, `vla_system.launch.py` 통합, `vla_gui` 창 실제로 뜨는지, `vla_pick_bridge`
+왕복 스모크)는 2026-08-10에 별도로 점검했다(`wrist_grasp_node`는 그 이후 삭제) — 결과는
 [`docs/state.md`](docs/state.md) 참고. `colcon build`가 `.venv`를 무시하고 노드를
 시스템 python3로 빌드해버리는 버그를 그 점검에서 찾아 `scripts/build.sh`에서 고쳤다
 (`.venv` source + `python3 -m colcon build` — apt `colcon`은 venv를 활성화해도 자기
@@ -615,16 +551,22 @@ tool 스키마 strict 규약, 클래스 필터링 후 box↔mask 인덱스 정�
 
 ## 안전 설계
 
-- `motion_enabled` 기본 false. GUI에서 명시적으로 체크해야 실제 모션이 켜진다
-- 정지는 LLM을 거치지 않는 별도 경로 (GUI 키워드 / ESC / 정지 버튼 → `move_stop`)
-- 모든 모션이 취소 가능. 폴링 주기마다 취소 플래그 확인
-- 파지 완료 시점을 즉시 보고해서, 들어올리는 중 정지해도 "쥐고 있음"이 유실되지 않음
+이 ws가 담당하는 것(cobot2_ws `pick_fsm` 내부의 모션/충돌회피/그리퍼 안전장치는
+그쪽 책임이라 여기 없다):
+
+- 정지는 LLM을 거치지 않는 별도 경로 (GUI 키워드 / ESC / 정지 버튼 → `/vla/estop`
+  → `vla_pick_bridge`가 조건 없이 `cmd:"abort"`를 cobot2_ws로 발행)
+- 판단 시작 시점의 stop epoch을 기억해 정지 이후 발행을 막는 이중 방어
+  (`vla_agent`의 epoch 비교 + `vla_pick_bridge`의 타임스탬프 비교)
 - 동시에 하나의 액션만 실행. 두 번째 액션은 큐에 쌓지 않고 거부
-- 실행 직전 최신 scene에서 좌표를 다시 읽음 (LLM이 본 좌표는 이미 오래됨)
-- 오래된 scene, 위치 미확정 물체, 작업공간 밖 좌표는 전부 거부
-- 캘리브레이션 frame 불일치 시 좌표를 아예 발행하지 않음
+  (`vla_pick_bridge.pending_action`)
+- 카메라 장면이 `max_scene_age_s`보다 오래됐으면 명령을 보내지 않음
+- cobot2_ws가 `result_timeout_s` 안에 응답하지 않으면 `failed`로 포기 (요청이
+  영원히 매달려 있지 않도록)
+- `place=table/discard`는 cobot2_ws teach가 끝나기 전까지
+  `allow_unverified_place`(기본 false)로 거부
 - 연속 실패가 임계치를 넘으면 자동 진행을 멈추고 사용자에게 넘김
-- 이미 물체를 들고 있으면 새로 집지 않음
+- 이미 물체를 들고 있으면 새로 집지 않음 (`robot_state.holding` 기준)
 
 ## 남은 검증
 
@@ -632,15 +574,14 @@ tool 스키마 strict 규약, 클래스 필터링 후 box↔mask 인덱스 정�
 검증됐다(`colcon build`, 각 노드 `ros2 run`/`ros2 launch`, `vla_pick_bridge` 왕복
 스모크 — [`docs/state.md`](docs/state.md)). 아직 안 된 것:
 
-1. ~~`colcon build --symlink-install`~~ ✅ PASS (2026-08-10)
-2. 고정 카메라 캡처와 테이블 보정 재측정, 매핑 좌표를 실제 자로 검증 — **카메라 구성이
-   바뀌었으므로(위 "카메라 구성 정정") 재측정 전에 먼저 무엇을 찍고 있는지부터 확인**
-3. DRY-RUN으로 시나리오 1~4 대화 검증 및 LLM 응답 지연 측정 — `OPENAI_API_KEY` 없어서
-   아직 실제 LLM 왕복은 미검증
-4. `/dsr01/motion/move_stop` 서비스 존재 확인 (`ros2 service list | grep move_stop`)
-5. 저속·넓은 안전공간에서 단일 물체 실제 pick, 모션 중 정지 반응 시간 측정
-6. place joint, TCP 방향, gripper width/force 현장 보정
-7. `vla_pick_bridge`를 실제 `cobot2_ws`(`vla_command_node`가 같이 뜬 상태)와 왕복 —
-   지금까지는 이 ws 혼자 가짜 `/vla/pick_result`로 스모크한 것뿐이다
+1. ~~`colcon build --symlink-install`~~ ✅ PASS (2026-08-10, `robot_node`/
+   `wrist_grasp_node` 삭제 후 2026-08-11 재확인)
+2. 고정 카메라 캡처와 테이블 보정(GUI 표시용) — 실행에는 안 쓰이므로 급하지 않음,
+   ⚠ 표시가 신경 쓰이면 `ros2 run vla_system table_homography_test`로 측정
+3. `vla_pick_bridge`를 실제 `cobot2_ws`(`vla_command_node`가 같이 뜬 상태)와 왕복 —
+   지금까지는 이 ws 혼자 가짜 `/vla/pick_result`로 스모크한 것뿐이다. `place`
+   거부 경로(§4 "지금 남은 일")도 이때 같이 확인
+4. 모션·그리퍼·정지 반응 시간·place joint·TCP·gripper force 현장 보정은 전부
+   `cobot2_ws` 쪽 검증 항목이다 — 이 ws에는 더 이상 그 코드가 없다
 
 변경 내역은 `MIGRATION.md`에 정리돼 있다.

@@ -50,20 +50,20 @@ class ScenePayloadTest(unittest.TestCase):
         payload = scene_to_payload(scene)
         self.assertEqual(payload["visible_objects"][0]["position_base"], [0.412, -0.18, 0.05])
 
-    def test_unpositioned_objects_are_listed_but_not_pickable(self):
+    def test_unpositioned_objects_are_still_pickable(self):
+        """cobot2_ws's pick_fsm computes its own grasp coordinate from the
+        class name alone (bridge/pick_bridge.py) -- this ws's own
+        position_valid/calibration has nothing to do with whether an object
+        can be picked, so every visible object is reported pickable."""
         scene = FakeScene([FakeObject("apple_17", "apple", valid=False)])
         entry = scene_to_payload(scene)["visible_objects"][0]
-        self.assertFalse(entry["pickable"])
+        self.assertTrue(entry["pickable"])
         self.assertNotIn("position_base", entry)
 
     def test_missing_scene_says_so_instead_of_looking_empty(self):
         payload = scene_to_payload(None)
         self.assertEqual(payload["visible_objects"], [])
         self.assertIn("note", payload)
-
-    def test_bad_calibration_is_announced(self):
-        scene = FakeScene([FakeObject("apple_17", "apple")], calibration_ok=False)
-        self.assertIn("note", scene_to_payload(scene))
 
 
 class RobotStatePayloadTest(unittest.TestCase):
