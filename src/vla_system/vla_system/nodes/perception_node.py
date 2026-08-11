@@ -1,40 +1,51 @@
 #!/usr/bin/env python3
-"""Fixed perception logic: webcam -> YOLO-seg -> tracking -> robot base coords.
+"""Fixed perception logic: shared camera topic -> YOLO-seg -> tracking -> robot base coords.
 
 This node is deliberately the only place in the system that contains
 deterministic rules. It answers "what is on the table and where is it in the
 arm's own frame", and nothing else. Which of those objects to touch is not
 decided here -- that is the agent's job.
 
-The camera is a **fixed overhead webcam**, not the RealSense. The RealSense now
-rides on the wrist, so it cannot survey the table: whatever it sees depends on
-where the arm happens to be pointing, which is useless as a scene source. The
-webcam stays still, so one calibration keeps holding.
+The camera is the **fixed D435i that cobot2_ws's pick_fsm also uses** (shared
+hardware, confirmed 2026-08-10 -- see docs/context/constraints.md "카메라
+구성"). This node used to open `/dev/videoN` directly with `cv2.VideoCapture`,
+which is wrong for a shared camera: two independent V4L2 opens of the same
+RealSense device race and generally break one or both (2026-08-11 finding,
+same doc). Instead this subscribes the `image_topic` that a `realsense2_camera`
+driver publishes -- cobot2_ws's own launch when integrated, or this ws's own
+`realsense2_camera` node when run standalone. Either way there is exactly one
+process opening the device, and any number of subscribers.
 
-Because a single webcam has no depth, positions come from the table homography
-measured by `table_homography_test` (pixel -> base XY, plus a fitted tabletop
-plane for Z). That carries one standing assumption: **objects lie on the
-calibrated table**. A tall object's mask centre sits on its top face, so the
+Because a single color frame has no depth, positions come from the table
+homography measured by `table_homography_test` (pixel -> base XY, plus a fitted
+tabletop plane for Z). That carries one standing assumption: **objects lie on
+the calibrated table**. A tall object's mask centre sits on its top face, so the
 mapping reports where that face *would* touch the table -- off by a parallax
 error that grows with height and with distance from the camera axis. Good enough
 to send the arm to the right object; not good enough to close fingers blind,
 which is what the wrist RealSense is for later.
 
-Publishes one SceneSnapshot per captured frame. The agent samples the latest one
-at each decision point; the executor samples it again the instant it starts
+Publishes one SceneSnapshot per processed frame. The agent samples the latest
+one at each decision point; the executor samples it again the instant it starts
 moving, because a position from one LLM round-trip ago is already stale.
 """
 
+import threading
 from collections import deque
 from statistics import fmean
-from time import perf_counter
+from time import perf_counter, monotonic
 from typing import Optional
 
-import cv2
 import rclpy
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import Image
 from vla_interfaces.msg import SceneObject, SceneSnapshot
 
@@ -43,6 +54,7 @@ from vla_system.perception.detector import (
     YoloDetector,
     bgr_to_image_message,
     draw_tracks,
+    image_message_to_bgr,
     mask_centroid,
     object_id,
     result_to_detections,
@@ -55,7 +67,7 @@ from vla_system.perception.table_homography import (
 )
 from vla_system.perception.tracker import IoUTracker
 
-WEBCAM_FRAME_ID = "webcam"
+CAMERA_FRAME_ID = "shared_camera"
 
 
 class PerceptionNode(Node):
@@ -65,12 +77,15 @@ class PerceptionNode(Node):
         self.declare_parameter("scene_topic", "/vla/scene")
         self.declare_parameter("annotated_topic", "/vla/perception/annotated_image")
 
-        self.declare_parameter("webcam_device", "/dev/video8")
-        self.declare_parameter("webcam_width", 1280)
-        self.declare_parameter("webcam_height", 720)
-        self.declare_parameter("webcam_fps", 30.0)
-        self.declare_parameter("webcam_fourcc", "MJPG")
+        # realsense2_camera's default color topic. Whoever launched the driver
+        # (cobot2_ws in integrated mode, this ws's own realsense2_camera launch
+        # in standalone mode) owns the device; this node only subscribes.
+        self.declare_parameter("image_topic", "/camera/camera/color/image_raw")
         self.declare_parameter("capture_rate_hz", 15.0)
+        # A stale image is worse than no image: it is a real position for an
+        # object that has since moved. Same guard shape as vla_pick_bridge's
+        # max_scene_age_s.
+        self.declare_parameter("max_image_age_s", 2.0)
 
         self.declare_parameter(
             "calibration_file", "~/.ros/vla_table_homography.json"
@@ -116,10 +131,18 @@ class PerceptionNode(Node):
             self.get_parameter("require_inside_table").value
         )
 
-        # Camera before calibration: the loader needs the opened resolution to
-        # reject a calibration clicked at a different one.
-        self.capture = self._open_camera()
-        self.calibration = self._load_calibration()
+        # Calibration needs the camera's resolution to reject a calibration
+        # clicked at a different one, but that resolution is only known once
+        # the first Image message actually arrives (no more owned
+        # cv2.VideoCapture to query up front) -- loaded lazily in
+        # image_callback() the first time a frame comes in.
+        self.calibration = None
+        self._calibration_checked = False
+        self.frame_size: Optional[tuple[int, int]] = None
+        self.image_lock = threading.Lock()
+        self.latest_image: Optional[Image] = None
+        self.latest_image_monotonic = 0.0
+        self.max_image_age_s = float(self.get_parameter("max_image_age_s").value)
 
         self.detector = YoloDetector(
             backend=str(self.get_parameter("backend").value),
@@ -146,7 +169,8 @@ class PerceptionNode(Node):
         self.total_frames = 0
         self.total_objects = 0
         self.total_positioned = 0
-        self.read_failures = 0
+        self.missing_frames = 0
+        self.stale_frames = 0
         self.inference_ms = deque(maxlen=300)
         self.processing_ms = deque(maxlen=300)
 
@@ -164,6 +188,16 @@ class PerceptionNode(Node):
             self.annotated_publisher = self.create_publisher(
                 Image, str(self.get_parameter("annotated_topic").value), stream_qos
             )
+        # qos_profile_sensor_data (BEST_EFFORT) to match realsense2_camera's
+        # own publisher QoS -- RELIABLE here would simply never match it and
+        # the subscription would sit silent with no error (CLAUDE.md's QoS-
+        # mismatch trap).
+        self.create_subscription(
+            Image,
+            str(self.get_parameter("image_topic").value),
+            self.image_callback,
+            qos_profile_sensor_data,
+        )
 
         capture_rate = float(self.get_parameter("capture_rate_hz").value)
         if capture_rate <= 0.0:
@@ -177,10 +211,10 @@ class PerceptionNode(Node):
 
     # ------------------------------------------------------------------ setup
 
-    def _load_calibration(self):
+    def _load_calibration(self, frame_size: tuple[int, int]):
         path = str(self.get_parameter("calibration_file").value)
         try:
-            calibration = load_table_calibration(path, self.frame_size)
+            calibration = load_table_calibration(path, frame_size)
         except FileNotFoundError:
             self.get_logger().error(
                 f"table calibration not found: {path}. Run "
@@ -206,45 +240,42 @@ class PerceptionNode(Node):
         )
         return calibration
 
-    def _open_camera(self):
-        raw = str(self.get_parameter("webcam_device").value).strip()
-        source = int(raw) if raw.isdigit() else raw
-        capture = cv2.VideoCapture(source)
-        if not capture.isOpened():
-            raise RuntimeError(f"cannot open webcam: {raw}")
-        # Pixel format before size: uncompressed 720p is bandwidth-bound to about
-        # 5 fps on USB 2, which measured as 196ms per blocking read and made every
-        # published position a fifth of a second stale. MJPEG at the same size
-        # measured 64ms. Compression does not move pixels, so the homography
-        # stays valid; set this to "" if a camera dislikes the format.
-        fourcc = str(self.get_parameter("webcam_fourcc").value).strip()
-        if fourcc:
-            capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc[:4]))
-        capture.set(
-            cv2.CAP_PROP_FRAME_WIDTH, int(self.get_parameter("webcam_width").value)
-        )
-        capture.set(
-            cv2.CAP_PROP_FRAME_HEIGHT, int(self.get_parameter("webcam_height").value)
-        )
-        capture.set(cv2.CAP_PROP_FPS, float(self.get_parameter("webcam_fps").value))
-        # Ask for the smallest driver buffer available: a queued frame is a stale
-        # frame, and the arm is going to move based on it.
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        # A driver may quietly substitute a size it prefers, so read back what we
-        # actually got rather than trusting the request.
-        self.frame_size = (width, height)
-        self.get_logger().info(f"webcam {raw} opened at {width}x{height}")
-        return capture
+    def image_callback(self, message: Image) -> None:
+        with self.image_lock:
+            self.latest_image = message
+            self.latest_image_monotonic = monotonic()
+        # Calibration needs a resolution, which only exists once one frame has
+        # actually arrived -- checked once, not every callback, so a missing
+        # calibration file does not retry (and re-log the same error) 15x/s.
+        if not self._calibration_checked:
+            self._calibration_checked = True
+            self.frame_size = (message.width, message.height)
+            self.calibration = self._load_calibration(self.frame_size)
 
     # ------------------------------------------------------------------- scene
 
     def capture_once(self) -> None:
         started = perf_counter()
-        ok, frame = self.capture.read()
-        if not ok or frame is None:
-            self.read_failures += 1
+        with self.image_lock:
+            message = self.latest_image
+            age_s = (
+                monotonic() - self.latest_image_monotonic
+                if message is not None
+                else None
+            )
+        if message is None:
+            self.missing_frames += 1
+            return
+        if age_s is not None and age_s > self.max_image_age_s:
+            self.stale_frames += 1
+            return
+        try:
+            frame = image_message_to_bgr(message)
+        except ValueError as exc:
+            self.get_logger().error(
+                f"image_topic frame unusable ({exc})", throttle_duration_sec=10.0
+            )
+            self.missing_frames += 1
             return
 
         stamp = self.get_clock().now()
@@ -255,8 +286,12 @@ class PerceptionNode(Node):
         snapshot = SceneSnapshot()
         snapshot.header.stamp = stamp.to_msg()
         snapshot.header.frame_id = "base"
-        snapshot.camera_frame = WEBCAM_FRAME_ID
+        snapshot.camera_frame = CAMERA_FRAME_ID
         snapshot.calibration_ok = self.calibration is not None
+        # frame_size is set from the first Image message (image_callback) --
+        # always populated by the time capture_once can run at all, since
+        # capture_once returns early above when latest_image is still None.
+        snapshot.image_width, snapshot.image_height = self.frame_size
 
         labels: dict[int, str] = {}
         for detection in tracked:
@@ -330,8 +365,11 @@ class PerceptionNode(Node):
     def report(self) -> None:
         if not self.processing_ms:
             self.get_logger().warning(
-                f"no webcam frames captured ({self.read_failures} read failures). "
-                "check webcam_device."
+                f"no frames processed yet (missing={self.missing_frames} "
+                f"stale={self.stale_frames}). Is something publishing "
+                f"{self.get_parameter('image_topic').value}? "
+                "(cobot2_ws's realsense2_camera launch, or this ws's own "
+                "if run standalone)"
             )
             return
         positioned = (
@@ -344,17 +382,9 @@ class PerceptionNode(Node):
             f"positioned={positioned:.1f}% "
             f"inference_avg={fmean(self.inference_ms):.1f}ms "
             f"processing_avg={fmean(self.processing_ms):.1f}ms"
-            + (f" read_failures={self.read_failures}" if self.read_failures else "")
+            + (f" missing={self.missing_frames}" if self.missing_frames else "")
+            + (f" stale={self.stale_frames}" if self.stale_frames else "")
         )
-
-    def destroy_node(self) -> bool:
-        capture = getattr(self, "capture", None)
-        if capture is not None:
-            try:
-                capture.release()
-            except Exception:
-                pass
-        return super().destroy_node()
 
 
 def main(args=None):

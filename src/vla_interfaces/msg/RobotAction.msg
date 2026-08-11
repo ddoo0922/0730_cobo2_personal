@@ -8,4 +8,10 @@ std_msgs/Header header
 string action_id
 string name          # pick_and_place | pick_and_hold | release
 string object_id     # scene object handle; empty for release
+string place         # basket | table | discard; empty means "unspecified"
+                      # (bridge/cobot2_ws default to basket). Only pick_and_place
+                      # sets this -- vla-bridge-contract.md #2/#5. table/discard
+                      # are UNVERIFIED on real hardware as of 2026-08-10 (placeholder
+                      # joint values copied from home) -- vla_pick_bridge_node gates
+                      # them behind allow_unverified_place, default off.
 string reason        # the LLM's one-line rationale, for the GUI and the log

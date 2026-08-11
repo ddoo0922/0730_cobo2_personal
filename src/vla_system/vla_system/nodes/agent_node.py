@@ -238,15 +238,20 @@ class AgentNode(Node):
         message.focus_object_ids = list(object_ids or [])
         self.reply_publisher.publish(message)
 
-    def publish_action(self, name: str, object_id: str, reason: str) -> str:
+    def publish_action(
+        self, name: str, object_id: str, reason: str, place: str = ""
+    ) -> str:
         message = RobotAction()
         message.header.stamp = self.turn_stamp or self.get_clock().now().to_msg()
         message.action_id = uuid.uuid4().hex[:12]
         message.name = name
         message.object_id = object_id
+        message.place = place
         message.reason = reason
         self.action_publisher.publish(message)
-        self.get_logger().info(f"action {name}({object_id}) id={message.action_id}")
+        self.get_logger().info(
+            f"action {name}({object_id}, place={place!r}) id={message.action_id}"
+        )
         return message.action_id
 
     def publish_stop(self, reason: str) -> None:
@@ -393,7 +398,10 @@ class AgentNode(Node):
                     f"'{object_id}'는 아직 3D 위치를 확정하지 못해 집을 수 없습니다.",
                     False,
                 )
-            self.publish_action(name, object_id, reason)
+            # Only pick_and_place carries a destination -- pick_and_hold has no
+            # `place` in its schema (tools.py), so this is "" for that tool.
+            place = str(call.arguments.get("place", "")).strip()
+            self.publish_action(name, object_id, reason, place)
             return f"{object_id} 동작을 시작했습니다. 완료되면 알려드리겠습니다.", True
 
         if name == "cancel_current_action":

@@ -1,7 +1,14 @@
 # 자연어 대화 기반 자율 피킹 로봇팔
 
 사용자가 계속 말을 걸면 로봇이 맥락을 이해하고 물건을 집어 장바구니에 담는 시스템이다.
-Doosan M0609 + OnRobot RG2 + 고정 Webcam(Logitech C270) + 손목 Intel RealSense D435I 기준.
+Doosan M0609 + OnRobot RG2 기준.
+
+🔴 **카메라 구성 (2026-08-10 확인, 2026-08-11 코드 반영)**: 고정 카메라는 별도
+Logitech C270가 아니라, 로봇 실행을 전담하는 `cobot2_ws`의 `pick_fsm`이 쓰는 것과
+**같은 물리 D435i**다(공유). `vla_perception`은 이제 그 카메라를 직접 열지 않고
+ROS 토픽(`image_topic`)을 구독한다 — 아래 "좌표가 어디서 오는가" 절이 현재 코드를
+그대로 설명한다. **손목 RealSense 구성은 아직 미정.** 상세·근거는
+[`docs/context/constraints.md`](docs/context/constraints.md) "카메라 구성" 참고.
 
 "사과는 네가 담을거야" → 로봇이 사과를 집어 담고, 담는 도중 "그 사과는 집지마" →
 지금 향하던 사과를 즉시 취소한다.
@@ -28,7 +35,7 @@ LLM이 결정한다. 규칙 매처(`matcher.py`), 대상 큐(`target_queue`),
 flowchart LR
     GUI[vla_gui<br/>텍스트/음성, 정지 키워드] -->|/vla/user_utterance| AG[vla_agent<br/>LLM 판단 + 대화 기억]
     GUI -->|/vla/estop| RB[vla_robot<br/>moves.py 실행]
-    WC[고정 Webcam<br/>C270] --> PC[vla_perception<br/>YOLO-seg + table homography]
+    WC[고정 카메라<br/>D435i, cobot2_ws와 공유] --> PC[vla_perception<br/>YOLO-seg + table homography]
     PC -->|/vla/scene| AG
     PC -->|/vla/scene| RB
     PC -->|annotated_image| GUI
@@ -47,17 +54,22 @@ flowchart LR
 
 | 노드 | 책임 | 판단하는가 |
 |---|---|---|
-| `vla_perception` | 고정 Webcam 캡처, YOLO-seg 인스턴스 분할, IoU 추적, 마스크 색상, table homography로 base 좌표 | 아니오 (고정 로직) |
+| `vla_perception` | 고정 카메라 캡처, YOLO-seg 인스턴스 분할, IoU 추적, 마스크 색상, table homography로 base 좌표 | 아니오 (고정 로직) |
 | `vla_agent` | 결정 시점마다 LLM 호출, 대화 히스토리 유지, function calling | **예 (전부)** |
-| `vla_robot` | 액션을 실제 모션으로, 정지 경로 소유, 로봇 실제 상태 발행 | 아니오 (실행만) |
+| `vla_robot` | (단독 모드 전용, 기본 꺼짐) 액션을 실제 모션으로, 정지 경로 소유, 로봇 실제 상태 발행 | 아니오 (실행만) |
 | `vla_wrist` | 손목 RealSense YOLO-seg, hand-eye 변환, GraspGenX 6-DOF 파지 생성 | 아니오 (고정 로직) |
+| `vla_pick_bridge` | (cobot2_ws 연동 모드 전용, 기본 꺼짐) `RobotAction`→`/vla/pick_command` JSON 발행, `/vla/pick_result`→`RobotState` 역변환. `object_id`→`class` 변환이 핵심 | 아니오 (변환만) |
 | `vla_gui` | 입출력, STT, 정지 키워드 하드코딩, 되묻기 crop 표시, 손목 RealSense 화면 | 정지 키워드만 |
+
+**두 실행 모드는 상호 배타적이다** — `vla_robot`과 `vla_pick_bridge`가 같은 토픽
+(`/vla/robot/action`, `/vla/robot/state`)을 놓고 경합하므로 동시에 켜지 않는다.
+자세한 건 아래 "실행" 절.
 
 ## LLM이 호출할 수 있는 함수
 
 | 함수 | 하는 일 |
 |---|---|
-| `pick_and_place(object_id, reason)` | 집어서 장바구니에 담는다 |
+| `pick_and_place(object_id, place, reason)` | 집어서 지정한 곳(`basket`/`table`/`discard`, 미언급 시 `basket`)에 놓는다 |
 | `pick_and_hold(object_id, reason)` | 집어서 든 채로 대기한다 |
 | `release()` | 들고 있는 물체를 현재 위치에 놓는다 |
 | `cancel_current_action()` | 진행 중인 동작을 즉시 중단한다 |
@@ -116,12 +128,21 @@ ESC 키와 화면 우상단 **■ 정지** 버튼도 같은 경로다.
 
 ## 좌표가 어디서 오는가
 
-탐지 카메라는 **고정 Webcam**이다. RealSense는 손목에 있으므로 테이블을 조망할 수
-없다 — 무엇이 보이는지가 팔이 어디를 향하는지에 달려 있어서 장면 소스로 쓸 수 없다.
-Webcam은 움직이지 않으니 보정 한 번이 계속 유효하다.
+🔴 **2026-08-11 갱신**: 탐지 카메라는 별도 Webcam이 아니라 **cobot2_ws의 `pick_fsm`도
+쓰는 고정 D435i다(공유 하드웨어)**. `vla_perception`은 그 카메라를 직접 열지 않고
+`image_topic`(기본 `/camera/camera/color/image_raw`)을 **구독**한다 — 실제로 카메라를
+여는 건 `realsense2_camera` 드라이버(cobot2_ws 연동 시엔 그쪽 launch, 이 저장소만 단독
+실행할 땐 이 ws가 직접 띄운 `realsense2_camera`) 하나뿐이고, 이 노드는 몇 개든 붙을 수
+있는 구독자 중 하나다. 예전엔 `cv2.VideoCapture`로 `/dev/videoN`을 직접 열었는데,
+카메라가 진짜 공유라는 게 확정된 뒤(2026-08-10) 그 방식은 cobot2_ws의 드라이버와 같은
+장치를 두 프로세스가 독립적으로 여는 충돌 위험이 있어 바꿨다(`docs/context/constraints.md`
+"카메라 구성" 참고). RealSense는 depth를 갖고 있지만, 이 경로는 color 프레임만 쓰고
+깊이는 안 쓴다 — 아래 homography가 여전히 그 자리를 메운다(D435i 자체 depth로 넘어가는
+건 이번 변경 범위 밖).
 
-카메라 하나에는 깊이가 없다. 그래서 좌표는 `table_homography_test`로 측정한 테이블
-보정에서 온다: 픽셀 → base XY, 그리고 최소제곱으로 맞춘 테이블 평면에서 Z.
+카메라가 뭘 발행하든 이 노드가 쓰는 건 색상 프레임 한 장뿐이라 깊이가 없다. 그래서
+좌표는 `table_homography_test`로 측정한 테이블 보정에서 온다: 픽셀 → base XY, 그리고
+최소제곱으로 맞춘 테이블 평면에서 Z.
 
 여기에는 **물체가 보정한 테이블 위에 놓여 있다**는 가정이 하나 붙는다. 키가 있는
 물체의 마스크 중심은 그 물체의 윗면에 있으므로, 매핑은 "그 윗면이 테이블에 닿는다면
@@ -140,20 +161,19 @@ Webcam은 움직이지 않으니 보정 한 번이 계속 유효하다.
   말할 수 있지만 집으러 가지는 못한다.
 
 보정은 **픽셀 좌표**라서 해상도가 바뀌면 전부 무의미해진다. 그래서 보정 JSON에
-`image_size`를 함께 저장하고, `vla_perception`이 다른 해상도로 Webcam을 열면
-보정을 거부한다.
-
-무압축 720p는 USB 2에서 대역폭에 묶여 blocking read가 196 ms였다 (약 5 fps).
-MJPEG로 바꾸면 같은 해상도에서 64 ms다. 압축은 픽셀을 옮기지 않으므로 보정에
-영향이 없다. `webcam_fourcc` 기본값이 `MJPG`인 이유다.
+`image_size`를 함께 저장하고, 구독한 첫 프레임의 해상도가 다르면 보정을 거부한다
+(`image_topic`을 발행하는 쪽 — 보통 `realsense2_camera`의 `color_profile` 인자 —
+해상도가 바뀌면 재보정 필요).
 
 ## 두 카메라가 나누어 맡는 일
 
-고정 Webcam은 **무엇을 어디쯤**, 손목 RealSense는 **어떻게 잡을지**를 답한다.
+고정 D435i(color만 사용)는 **무엇을 어디쯤**, 손목 RealSense는 **어떻게 잡을지**를
+답한다.
 
-Webcam homography는 물체가 테이블 위에 있다고 가정하므로, 키가 있는 물체는 상단면
-시차만큼 좌표가 밀린다. 올바른 물체로 팔을 보내기엔 충분하지만 눈 감고 손가락을
-닫기엔 부족하다. 그래서 팔이 근처로 가는 동안부터 손목 카메라가 계속 다시 본다.
+고정 카메라의 homography는 물체가 테이블 위에 있다고 가정하므로, 키가 있는 물체는
+상단면 시차만큼 좌표가 밀린다. 올바른 물체로 팔을 보내기엔 충분하지만 눈 감고
+손가락을 닫기엔 부족하다. 그래서 팔이 근처로 가는 동안부터 손목 카메라가 계속
+다시 본다.
 
 ```
 손목에 목표 등록 (/vla/grasp/request)
@@ -309,6 +329,15 @@ cd ~/cobot2_ws && colcon build --symlink-install --packages-select voice_process
 이게 실패로 바뀌었으면 방금 설치가 `~/.local`을 건드린 것이다 — `.venv` 활성화 없이
 `pip install`을 부르지 않았는지부터 본다. 상세는 `CLAUDE.md` §1.
 
+🔴 **`~/.local/lib/python3.10/site-packages/`를 눈으로도 한 번 확인할 것** (2026-08-10
+실측 — 이 계정에서 실제로 발견됨): `pip check`가 조용히 넘어가도 이 폴더에 `anyio`,
+`sounddevice`, 부분 설치된 `nvidia`/`cuda` 폴더처럼 dist-info 없는 잔해가 남아있을 수
+있다. `.venv` 만들기 *전에* `pip install`을 한 번이라도 벗어난 상태로 불렀다면 남는
+흔적이다 — 지금 당장 뭔가를 깨진 않아도(apt `pytest`/`colcon build`는 정상 동작 확인),
+CLAUDE.md §1이 경고하는 바로 그 패턴이라 방치하면 다음 번 `~/.local`이 다시 앞순위로
+끼어들 때 조용히 문제가 된다. 지우기 전에 `pip show --files <패키지>`로 무엇이 설치했는지
+먼저 확인할 것 — 이 ws가 만든 게 아니면 임의로 지우지 않는다.
+
 Doosan ROS 2 패키지(`dsr_common2`, `dsr_msgs2`, `DSR_ROBOT2`)가 들어 있는
 overlay를 먼저 source한다. `scripts/env.sh`가 ROS · Doosan overlay ·
 이 워크스페이스 · `.env`를 한 번에 올려준다.
@@ -384,13 +413,70 @@ ROS 레벨이 아니라 장비 레벨 충돌이라 에러 없이 조용히 오�
 실기로 되돌릴 때 `src/vla_system/config/system.yaml`에서 확인할 것(참고용, 지금은
 이 경로로 실행하지 않는다):
 
-- 테이블 보정(`~/.ros/vla_table_homography.json`)이 현재 Webcam 설치와 테이블
-  위치에 맞는가. Webcam이나 테이블을 건드렸으면 다시 측정해야 한다
+- 테이블 보정(`~/.ros/vla_table_homography.json`)이 현재 카메라 설치와 테이블
+  위치에 맞는가. 카메라나 테이블을 건드렸으면 다시 측정해야 한다
   (없거나 못 읽으면 GUI 상단에 ⚠ 표시가 뜨고 모든 물체가 "집기 가능 X"가 된다)
 - `grasp_height_offset_m`이 집을 물체 높이에 맞는가
 - `workspace_*_m`가 실제 안전 작업공간보다 작게 설정됐는가
 - `place_joints`가 충돌 없는 위치인가
 - RG2 IP/포트/힘이 실제 장비와 일치하는가
+
+### 3. cobot2_ws 연동 — `vla_pick_bridge` (2026-08-10 추가, MVP)
+
+실제 로봇 실행은 `cobot2_ws`의 `pick_fsm`이 전담한다(위 2절). 이 ws가 할 일은 LLM이
+결정한 `object_id`를 `class`로 바꿔 `/vla/pick_command`(JSON)로 cobot2_ws에 넘기고,
+`/vla/pick_result`를 다시 `RobotState`로 되돌리는 것뿐이다 — 그 역할이
+`vla_pick_bridge`다.
+
+```bash
+ros2 launch vla_system vla_system.launch.py enable_pick_bridge:=true
+```
+
+🔴 **`enable_robot:=true`와 절대 같이 켜지 않는다** — 둘 다 `/vla/robot/action`을
+구독하고 `/vla/robot/state`를 발행해서 경합한다. `vla_pick_bridge`는 기본값이
+`false`다.
+
+#### 🔴 `enable_pick_bridge:=true`만으로는 cobot2_ws의 FSM 사이클이 시작되지 않는다
+
+이 노드는 `/vla/pick_command`를 쏘기만 한다. cobot2_ws의 `vla_command_node`는 그걸
+"한 건짜리 래치"에 쥐고 있다가 FSM이 `LISTENING`에 들어와야 건네주는데, FSM은
+`IDLE`에서 `/pick/start`가 불릴 때까지 멈춰 있다(`pick_fsm/states.py`). 기본 구성
+(`auto_start=false`)에서는 **사람이 cobot2_ws 쪽에서 rqt 패널 시작 버튼이나
+`/pick/start` 서비스를 직접 눌러야** LLM이 낸 지시가 실제로 소비된다.
+
+VLA의 판단(`pick_and_place` 호출)이 곧 사이클의 시작 트리거가 되게 하려면 —
+**이 ws가 아니라 cobot2_ws 쪽**에서 `vla_command_node`를 다음과 같이 띄워야 한다
+(다른 clone/프로세스라 여기 launch 파일로는 못 켠다):
+
+```bash
+# cobot2_ws에서
+ros2 launch voice_processing vla_command.launch.py auto_start:=true
+```
+
+`auto_start:=true`는 지시가 도착하면 `vla_command_node`가 대신 `/pick/start`를
+불러주는 것뿐이다 — `WAIT_APPROVAL`(실제 grasp 실행 승인)은 별개 스위치
+(`require_approval`)라 여전히 사람이 로컬(rqt/음성)로 눌러야 한다. 두 안전장치가
+독립적이라 이걸 켜도 승인 단계의 안전성은 줄지 않는다(`vla-bridge-contract.md`
+§0-B/§4). **2026-08-10 기준 이 ws에서 이 조합으로 왕복 검증한 적은 없다** — 다음
+cobot2_ws 세션에서 `auto_start:=true` + `vla_pick_bridge`를 같이 띄워 확인 필요.
+
+**검증 상태** (2026-08-11, `docs/state.md` "cobot2_ws 통합" 참고):
+
+- ✅ 실제 `cobot2_ws`의 `vla_command_node`와 같이 띄워서 JSON 경계(class/place 파싱,
+  accepted/rejected 왕복, TTL 만료)까지 확인함 — `ROS_DOMAIN_ID=93`을 양쪽에 맞춰야
+  서로 보인다(기본값이 다르다).
+- ❌ `pick_fsm`(실제 grasp 시퀀스, `WAIT_APPROVAL`, 로봇 동작)은 아직 미검증 — 그
+  다음 단계는 실기 리스크가 있어 별도로 진행.
+- `place`(장바구니/테이블/폐기 지정) 필드는 이제 보낸다 — `pick_and_place` 툴이
+  `place`(`basket`/`table`/`discard`)를 필수 인자로 받아 그대로 실어 보낸다. 다만
+  `table`/`discard`는 cobot2_ws 쪽 teach가 아직 안 끝나(placeholder 관절값,
+  `vla-bridge-contract.md` §5) `vla_pick_bridge`의 `allow_unverified_place`(기본
+  `false`)가 막아둔다 — teach 끝나면 그 파라미터만 뒤집으면 된다.
+- 같은 클래스 물체가 2개 이상이면 "1번"으로 되물어도 cobot2_ws가 아무 물체나 집을
+  수 있다 — `class`만 경계를 넘고 개체 단위 좌표(`pixel`)는 아직 안 쓴다.
+- `allowed_classes`(cobot2_ws가 인식하는 클래스 목록)와 이 ws YOLO의
+  `target_classes`가 이름 단위로 안 맞으면 일부 클래스는 즉시 거부된다. 두 YOLO를
+  맞출지는 아직 미정 — 지금은 손대지 않았다.
 
 ## 설정
 
@@ -409,13 +495,16 @@ ROS 레벨이 아니라 장비 레벨 충돌이라 에러 없이 조용히 오�
 | `vla_robot.poll_interval_s` | 정지 반응 지연의 상한 |
 | `vla_robot.max_scene_age_s` | 이보다 오래된 장면으로는 집으러 가지 않는다 |
 | `vla_perception.backend` / `device` | `pytorch` + `cuda:0` (기본) 또는 `openvino` + `intel:gpu` |
-| `vla_perception.webcam_device` | 고정 Webcam 장치. `/dev/video*` 이름으로 확인할 것 |
-| `vla_perception.webcam_fourcc` | 기본 `MJPG`. 무압축 720p는 USB 2에서 ~5 fps로 묶인다 |
+| `vla_perception.image_topic` | 고정 D435i color 토픽. 기본 `/camera/camera/color/image_raw` — `realsense2_camera`가 발행하는 것과 같아야 한다 |
+| `vla_perception.max_image_age_s` | 이보다 오래된 카메라 프레임은 버린다 (기본 2.0s) |
 | `vla_perception.calibration_file` | `table_homography_test`가 저장한 보정. 없으면 좌표가 전부 보류된다 |
 | `vla_perception.grasp_height_offset_m` | 테이블 높이에 더해 파지 Z를 만든다 (기본 0.02) |
 | `vla_perception.require_inside_table` | 보정 사각형 밖 물체는 좌표를 주지 않는다 (기본 true) |
 | `vla_perception.use_masks` | 색상 판정과 테이블에 매핑할 픽셀을 마스크 안쪽으로 제한한다 (기본 true) |
 | `vla_robot.dry_run_motion_s` | DRY-RUN에서 모션 한 구간이 걸리는 시간. 말로 끼어들어 테스트하려면 늘린다 |
+| `vla_pick_bridge.pick_command_topic` / `pick_result_topic` | cobot2_ws `vla_command_node`와 맞닿는 JSON 토픽. 기본값이 그쪽 기본값과 일치해야 한다 |
+| `vla_pick_bridge.result_timeout_s` | cobot2_ws가 이 시간 안에 결과를 안 주면 `failed`로 포기한다 (기본 60s, cobot2_ws의 `wait_timeout_sec` 50s보다 여유 있게) |
+| `vla_pick_bridge.allow_unverified_place` | `place=table/discard`를 실제로 보낼지 (기본 `false`). cobot2_ws의 teach가 끝나기 전까지 켜지 않는다 |
 
 좌표 단위 계약:
 
@@ -427,15 +516,21 @@ ROS 레벨이 아니라 장비 레벨 충돌이라 에러 없이 조용히 오�
 ## 테스트
 
 ```bash
+source /opt/ros/humble/setup.bash && source install/setup.bash  # 🔴 필요 -- 아래 참고
 source .venv/bin/activate   # 없으면 위 설치 절부터 (--user 금지 — CLAUDE.md §1)
 python3 -m pip install -r requirements-dev.txt
 ./scripts/check.sh
 ```
 
-순수 로직만 다룬다 — ROS도 카메라도 로봇도 필요 없다.
+🔴 **ROS를 먼저 소싱해야 한다** (2026-08-10 실측 정정 — 예전엔 "ROS도 카메라도
+로봇도 필요 없다"였는데 지금은 아니다). `test_wrist_async_state.py`가
+`vla_interfaces`(빌드 산출물)를 import하므로 `install/setup.bash`가 없으면
+collection 자체가 실패한다. 나머지 테스트는 여전히 순수 로직만 다룬다 — ROS
+런타임(노드 기동)이나 카메라·로봇은 필요 없다, `vla_interfaces`가 PYTHONPATH에
+잡히기만 하면 된다.
 
 ```text
-196 passed
+271 passed
 XML/YAML validation passed
 ```
 
@@ -444,7 +539,7 @@ XML/YAML validation passed
 tool 스키마 strict 규약, 클래스 필터링 후 box↔mask 인덱스 정합, HSV 7색 밴드와
 마스크 색상 판정, table homography 좌표(mm→m 경계, 보정 사각형 밖 거부, 해상도
 불일치 거부, 손상된 보정 파일 거부), 잔여 프로세스 정리(신호 단계 상승, 좀비 판정,
-조상 프로세스 보호).
+조상 프로세스 보호), `vla_pick_bridge`의 JSON 빌드·result 매핑·object_id→class 조회.
 
 ### 실제 ROS 런타임에서 확인한 것
 
@@ -463,6 +558,15 @@ tool 스키마 strict 규약, 클래스 필터링 후 box↔mask 인덱스 정�
 | 위치 미확정 물체 / 장면에 없는 id | 각각 `failed`, 모션 없음 |
 | 실행 중 두 번째 동작 도착 | 큐에 쌓지 않고 `rejected`, 진행 중 동작은 그대로 완료 |
 
+별개로, **로봇/그리퍼를 뺀 나머지 노드가 전부 뜨는지**(colcon build, `perception_node`
+단독, `vla_system.launch.py` 통합, `wrist_grasp_node`, `vla_gui` 창 실제로 뜨는지,
+`vla_pick_bridge` 왕복 스모크)는 2026-08-10에 별도로 점검했다 — 결과는
+[`docs/state.md`](docs/state.md) 참고. `colcon build`가 `.venv`를 무시하고 노드를
+시스템 python3로 빌드해버리는 버그를 그 점검에서 찾아 `scripts/build.sh`에서 고쳤다
+(`.venv` source + `python3 -m colcon build` — apt `colcon`은 venv를 활성화해도 자기
+자신은 시스템 python3로 실행되기 때문에 생기는 문제, 상세는
+[`docs/context/constraints.md`](docs/context/constraints.md)).
+
 ## 안전 설계
 
 - `motion_enabled` 기본 false. GUI에서 명시적으로 체크해야 실제 모션이 켜진다
@@ -478,14 +582,19 @@ tool 스키마 strict 규약, 클래스 필터링 후 box↔mask 인덱스 정�
 
 ## 남은 검증
 
-이 코드를 작성한 환경에는 ROS 2 런타임, RealSense, Doosan 드라이버, 실제 장비가
-없다. 대상 노트북에서 순서대로 확인해야 한다.
+2026-08-10 기준 GPU·카메라·로봇이 있는 실기 머신에서 로봇/그리퍼를 뺀 나머지는
+검증됐다(`colcon build`, 각 노드 `ros2 run`/`ros2 launch`, `vla_pick_bridge` 왕복
+스모크 — [`docs/state.md`](docs/state.md)). 아직 안 된 것:
 
-1. `colcon build --symlink-install`
-2. 고정 Webcam 캡처와 테이블 보정 재측정, 매핑 좌표를 실제 자로 검증
-3. DRY-RUN으로 시나리오 1~4 대화 검증 및 LLM 응답 지연 측정
+1. ~~`colcon build --symlink-install`~~ ✅ PASS (2026-08-10)
+2. 고정 카메라 캡처와 테이블 보정 재측정, 매핑 좌표를 실제 자로 검증 — **카메라 구성이
+   바뀌었으므로(위 "카메라 구성 정정") 재측정 전에 먼저 무엇을 찍고 있는지부터 확인**
+3. DRY-RUN으로 시나리오 1~4 대화 검증 및 LLM 응답 지연 측정 — `OPENAI_API_KEY` 없어서
+   아직 실제 LLM 왕복은 미검증
 4. `/dsr01/motion/move_stop` 서비스 존재 확인 (`ros2 service list | grep move_stop`)
 5. 저속·넓은 안전공간에서 단일 물체 실제 pick, 모션 중 정지 반응 시간 측정
 6. place joint, TCP 방향, gripper width/force 현장 보정
+7. `vla_pick_bridge`를 실제 `cobot2_ws`(`vla_command_node`가 같이 뜬 상태)와 왕복 —
+   지금까지는 이 ws 혼자 가짜 `/vla/pick_result`로 스모크한 것뿐이다
 
 변경 내역은 `MIGRATION.md`에 정리돼 있다.

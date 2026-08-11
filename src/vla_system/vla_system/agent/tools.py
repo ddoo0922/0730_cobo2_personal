@@ -48,17 +48,52 @@ def _object_argument(description: str) -> dict:
     }
 
 
+# vla-bridge-contract.md #5. table/discard 값 자체는 여기서 막지 않는다 -- 실기
+# 검증(teach) 여부는 하드웨어 사정이지 스키마 사정이 아니다. 대신
+# vla_pick_bridge_node가 allow_unverified_place(기본 false)로 실행을 막는다:
+# 모델이 골라도 되고, 브리지가 실제로 보낼지는 따로 판단한다.
+PLACE_VALUES = ("basket", "table", "discard")
+
+
+def _pick_and_place_argument() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "object_id": {
+                "type": "string",
+                "description": "scene의 visible_objects에 있는 id를 그대로 쓴다. 예: apple_17",
+            },
+            "place": {
+                "type": "string",
+                "enum": list(PLACE_VALUES),
+                "description": (
+                    "어디에 놓을지. basket=장바구니(사용자가 목적지를 말하지 않았으면 "
+                    "이걸 골라라), table=작업테이블 지정 자리, discard=폐기 자리. "
+                    "table/discard는 사용자가 명시적으로 그 목적지를 말했을 때만 골라라 "
+                    "-- 아직 실기에서 검증되지 않아 브리지가 거부할 수 있고, 그러면 "
+                    "그 사실을 그대로 설명해라."
+                ),
+            },
+            "say": {
+                "type": "string",
+                "description": "무엇을 왜 집는지 사용자에게 할 한 문장. 그대로 들린다.",
+            },
+        },
+        "required": ["object_id", "place", "say"],
+        "additionalProperties": False,
+    }
+
+
 TOOLS = [
     {
         "type": "function",
         "name": "pick_and_place",
         "description": (
-            "지정한 물체를 집어서 장바구니에 담는다. 사용자가 담으라고 명시한 물체에만 사용한다. "
-            "한 번에 하나만 호출할 수 있고, 동작이 끝나면 다시 판단 기회가 주어진다."
+            "지정한 물체를 집어서 지정한 곳에 놓는다. 사용자가 담으라고/치우라고 명시한 "
+            "물체에만 사용한다. 한 번에 하나만 호출할 수 있고, 동작이 끝나면 다시 판단 "
+            "기회가 주어진다."
         ),
-        "parameters": _object_argument(
-            "scene의 visible_objects에 있는 id를 그대로 쓴다. 예: apple_17"
-        ),
+        "parameters": _pick_and_place_argument(),
         "strict": True,
     },
     {

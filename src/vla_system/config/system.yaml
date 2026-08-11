@@ -3,22 +3,19 @@ vla_perception:
     scene_topic: /vla/scene
     annotated_topic: /vla/perception/annotated_image
 
-    # The fixed overhead webcam (Logitech C270), opened directly with V4L2 --
-    # not the RealSense, which now rides on the wrist and cannot survey the
-    # table. Check the device number with:
-    #   for d in /dev/video*; do echo "$d $(cat /sys/class/video4linux/$(basename $d)/name)"; done
-    webcam_device: /dev/video0
-    webcam_width: 1280
-    webcam_height: 720
-    webcam_fps: 30.0
-    # MJPEG, because uncompressed 720p is bandwidth-bound to ~5 fps on USB 2
-    # (196ms per blocking read, measured) versus 64ms for MJPEG. Compression does
-    # not move pixels, so the homography is unaffected. Set "" to leave the
-    # driver default.
-    webcam_fourcc: MJPG
+    # The fixed D435i that cobot2_ws's pick_fsm also uses (shared hardware,
+    # confirmed 2026-08-10). Subscribed, not opened directly -- two independent
+    # V4L2 opens of the same RealSense device race (2026-08-11 finding,
+    # docs/context/constraints.md "카메라 구성"). Whoever launches
+    # realsense2_camera (cobot2_ws when integrated, this ws's own launch when
+    # run standalone) owns the device; this is just a subscriber.
+    image_topic: /camera/camera/color/image_raw
     # Inference is synchronous, so this is an upper bound: a frame slower than
     # the tick just delays the next one rather than piling up work.
     capture_rate_hz: 15.0
+    # A frame older than this is a real position for an object that has since
+    # moved -- withheld rather than published stale.
+    max_image_age_s: 2.0
 
     # Written by 'ros2 run vla_system table_homography_test'. Without it the
     # scene still lists objects, but none of them get a base position.
@@ -279,3 +276,32 @@ vla_robot:
     gripper_port: 502
     gripper_force_n: 40.0
     grip_settle_s: 0.5
+
+vla_pick_bridge:
+  ros__parameters:
+    action_topic: /vla/robot/action
+    stop_topic: /vla/robot/stop
+    estop_topic: /vla/estop
+    state_topic: /vla/robot/state
+    scene_topic: /vla/scene
+    # cobot2_ws's vla_command_node -- a different process in a different git
+    # clone. These two must match its command_topic/result_topic defaults
+    # exactly (voice_processing/vla_command_node.py). Same machine only, per
+    # the current same-PC architecture (docs/state.md "cobot2_ws 통합" #2 --
+    # still needs its own confirmation).
+    pick_command_topic: /vla/pick_command
+    pick_result_topic: /vla/pick_result
+    max_scene_age_s: 2.0
+    # cobot2_ws's own wait_timeout_sec default is 50s (vla_command_node) --
+    # stay above it so a slow-but-real answer is never mistaken for a dead
+    # one.
+    result_timeout_s: 60.0
+    # "Is motion enabled" has no real switch on this side any more -- true
+    # because the point of routing through this bridge is that motion really
+    # does happen, just on cobot2_ws's arm.
+    motion_enabled: true
+    # table/discard place values are placeholder joint poses on real hardware
+    # as of 2026-08-10, not taught to a safe pose yet (vla-bridge-contract.md
+    # #5). Flip this once cobot2_ws confirms they're teach-complete -- do not
+    # flip it to unblock a demo.
+    allow_unverified_place: false

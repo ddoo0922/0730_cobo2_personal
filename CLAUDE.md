@@ -57,13 +57,32 @@ python3 -m pip install "setuptools<80,>=30.3.0" "packaging>=23"
   cobot2_ws가 로컬(rqt 버튼 + 음성 `approve_listener_node`)로 처리한다 — 이 ws가 다시
   구현할 필요 없다.
 
-## 3. 지금 남은 일 — `vla_pick_bridge` (미착수)
+## 3. 지금 남은 일
 
-cobot2_ws 쪽(`vla_command_node`)은 완성됐다. 이 ws에 아직 없는 것: `RobotAction`
-(`/vla/robot/action`)을 받아 `object_id→class` 변환 후 `/vla/pick_command`로 발행하고,
-`/vla/pick_result`를 `RobotState`로 되돌리는 노드 하나. 입출력 표·LLM 툴 스키마에서 고칠
-부분(`pick_and_place`에 `place` 인자 추가, `pick_and_hold`/`release` 제거)은
-`vla-bridge-contract.md` §7 참고.
+`vla_pick_bridge`(`RobotAction`→`/vla/pick_command`, `/vla/pick_result`→`RobotState`)와
+`pick_and_place`의 `place` 인자(basket/table/discard)는 구현 완료(2026-08-10, 상세는
+`docs/state.md` "cobot2_ws 통합"). `table`/`discard`는 cobot2_ws 쪽 teach가 안 끝나
+`vla_pick_bridge_node`의 `allow_unverified_place`(기본 false)로 막혀 있다 — teach 끝나면
+그 파라미터만 뒤집는다, 코드는 안 건드린다.
+
+🔴 **`pick_and_hold`/`release` 툴은 제거하지 않는다 — 2026-08-11 정정.** 예전 노트가
+"cobot2_ws가 못 받으니 프롬프트에서 지우는 게 맞다"고 했던 건 `vla_pick_bridge`
+관점만 본 반쪽 결론이었다. `agent/tools.py`는 `enable_robot`(단독 모드)과
+`enable_pick_bridge`(cobot2_ws 연동) 양쪽이 **공유**하는데, `robot_node.py`
+(단독 모드)에서 `pick_and_hold`/`release`는 실제로 동작하는 기능이다(`PICK_ACTIONS`,
+`self.holding` 상태로 "쥔 채 대기" → 나중에 `release`). 지우면 cobot2_ws 연동 모드의
+UX만 좋아지고 단독 모드의 실기능 하나가 없어진다. 지금처럼 스키마엔 남겨두고
+`vla_pick_bridge`가 로컬에서 거부하는 현재 구조가 맞다 — 손대지 않는다.
+
+남은 것: `vla_pick_bridge`↔cobot2_ws 실기 왕복 스모크(특히 `place` 거부 경로
+미검증). 그 외엔 `docs/state.md` "확인/결정이 안 끝난 것" 절 참고 — 대부분 사용자
+결정 대기 또는 cobot2_ws 쪽 확인 필요라 이 ws 혼자 진행 못 함.
+
+**🔴 `enable_pick_bridge:=true`만으로는 cobot2_ws FSM이 안 돈다.** `pick_fsm`은
+`/pick/start`가 불릴 때까지 `IDLE`에 멈춰 있다 — 기본은 사람이 직접 누르는 것.
+cobot2_ws 쪽에서 `vla_command.launch.py auto_start:=true`로 띄워야 VLA의 판단이 곧
+시작 트리거가 된다(다른 clone이라 이 ws에서 대신 켤 수 없음). 상세·미검증 여부는
+`docs/state.md` "auto_start" 절, README.md #3 참고.
 
 ## 4. 하드웨어 — 🔴 카메라 구성 정정 (2026-08-10, 사용자 확인)
 

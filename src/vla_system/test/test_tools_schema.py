@@ -59,6 +59,13 @@ class ToolSchemaTest(unittest.TestCase):
                 f"{tool['name']} has nothing to tell the user",
             )
 
+    def test_pick_and_place_carries_a_destination(self):
+        tool = next(t for t in TOOLS if t["name"] == "pick_and_place")
+        properties = tool["parameters"]["properties"]
+        self.assertEqual(
+            set(properties["place"]["enum"]), {"basket", "table", "discard"}
+        )
+
     def test_clarification_can_carry_candidates_for_the_gui_to_crop(self):
         tool = next(t for t in TOOLS if t["name"] == "ask_clarification")
         properties = tool["parameters"]["properties"]

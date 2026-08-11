@@ -422,7 +422,6 @@ class VLAApp:
         self.current_fps = 0.0
         self.last_state_key: tuple | None = None
 
-        self.real_robot_var = tk.BooleanVar(value=False)
         self.wrist_grasp_var = tk.BooleanVar(value=False)
 
         self._configure_window()
@@ -514,29 +513,22 @@ class VLAApp:
         )
         self.stop_button.grid(row=0, column=0, padx=(0, 12))
 
-        # vla_robot is disabled at the launch level (enable_robot:=false) --
-        # cobot2_ws's pick_fsm owns the robot/gripper now. Keep the control
-        # visible but inert so it can't silently no-op a checked "real robot"
-        # run: start_pipeline() never passes enable_robot:=true.
-        self.robot_check = ttk.Checkbutton(
-            controls,
-            text="실제 로봇 모션 (cobot2_ws pick_fsm 전담 — 비활성)",
-            variable=self.real_robot_var,
-            state="disabled",
-        )
-        self.robot_check.grid(row=0, column=1, padx=(0, 8))
+        # 2026-08-11 제거: "실제 로봇 모션" 체크박스는 영구 비활성(state="disabled")으로
+        # 죽어있던 컨트롤이었다 -- cobot2_ws의 pick_fsm이 로봇을 전담하게 되면서 GUI가
+        # enable_robot:=true를 보낼 일이 아예 없어졌고, real_robot_var는 항상 False였다.
+        # (기존 팀원 코드, 2026-08-11 사용자 승인 후 제거)
 
         # Off by default: it loads a second YOLO plus GraspGenX (~1.2 GB VRAM)
         # and is only useful with the RealSense actually mounted on the wrist.
         self.wrist_check = ttk.Checkbutton(
             controls, text="손목 파지 (GraspGenX)", variable=self.wrist_grasp_var
         )
-        self.wrist_check.grid(row=0, column=2, padx=(0, 8))
+        self.wrist_check.grid(row=0, column=1, padx=(0, 8))
 
         self.pipeline_button = ttk.Button(
             controls, text="VLA 시작", command=self.toggle_pipeline
         )
-        self.pipeline_button.grid(row=0, column=3)
+        self.pipeline_button.grid(row=0, column=2)
 
         # ------------------------------------------------- left: perception
 
@@ -948,18 +940,11 @@ class VLAApp:
         if not self._clear_leftover_pipeline():
             return
 
-        motion_enabled = bool(self.real_robot_var.get())
-        if motion_enabled and not messagebox.askyesno(
-            "실제 로봇 모션",
-            "robot_node를 motion_enabled=true로 시작합니다.\n"
-            "Doosan M0609와 RG2 주변이 안전한 상태인지 확인했습니까?",
-            parent=self.root,
-        ):
-            return
-
+        # enable_robot은 launch 기본값 false 그대로 -- GUI에서 실제 로봇 모션을 켜는
+        # 경로 자체가 없다(cobot2_ws pick_fsm이 전담, 위 "제거" 주석 참고). motion_enabled
+        # 인자도 그래서 안 보낸다: vla_robot 자체가 안 뜨니 값을 줘도 아무 효과가 없다.
         wrist_grasp = bool(self.wrist_grasp_var.get())
         command = BASE_LAUNCH_COMMAND + [
-            f"motion_enabled:={'true' if motion_enabled else 'false'}",
             f"enable_wrist_grasp:={'true' if wrist_grasp else 'false'}",
         ]
         try:
@@ -984,13 +969,11 @@ class VLAApp:
 
         self.pipeline_process = process
         self.pipeline_button.configure(text="VLA 정지")
-        self.robot_check.configure(state="disabled")
         self.wrist_check.configure(state="disabled")
         self.append_chat(
             "system",
-            f"VLA 파이프라인을 시작했습니다. 실행 모드: "
-            f"{'실제 로봇' if motion_enabled else 'DRY-RUN'}"
-            f"{' | 손목 파지 ON' if wrist_grasp else ''}"
+            f"VLA 파이프라인을 시작했습니다."
+            f"{' 손목 파지 ON' if wrist_grasp else ''}"
             f"\n전체 로그: {PIPELINE_LOG_PATH}",
         )
         threading.Thread(
