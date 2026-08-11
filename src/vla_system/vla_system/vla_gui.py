@@ -88,7 +88,6 @@ BASE_LAUNCH_COMMAND = [
     "launch",
     "vla_system",
     "vla_system.launch.py",
-    "enable_realsense:=true",
 ]
 
 _INTERESTING_LOG_TOKENS = (
@@ -423,6 +422,11 @@ class VLAApp:
         self.last_state_key: tuple | None = None
 
         self.wrist_grasp_var = tk.BooleanVar(value=False)
+        # 2026-08-11: 기본을 cobot2_ws 연동으로 바꿈 -- 이 GUI가 최종적으로 존재하는
+        # 이유가 pick_fsm과 물려 돌리는 것이라, 단독 모드(vla_robot)가 예외가 되어야
+        # 한다. 켜져 있으면 enable_pick_bridge:=true + enable_realsense:=false(카메라는
+        # cobot2_ws 쪽 launch가 이미 잡고 있다는 전제, README §4)를 같이 보낸다.
+        self.pick_bridge_var = tk.BooleanVar(value=True)
 
         self._configure_window()
         self._configure_style()
@@ -520,15 +524,26 @@ class VLAApp:
 
         # Off by default: it loads a second YOLO plus GraspGenX (~1.2 GB VRAM)
         # and is only useful with the RealSense actually mounted on the wrist.
+        # 기본 켜짐: cobot2_ws pick_fsm이 카메라를 이미 잡고 있다는 전제로
+        # enable_pick_bridge:=true + enable_realsense:=false를 함께 보낸다(README §4).
+        # 이 ws 카메라로 단독 실행하려면 체크를 끈다 -- 그러면 enable_realsense:=true로
+        # 되돌아간다(예전 기본 동작).
+        self.pick_bridge_check = ttk.Checkbutton(
+            controls,
+            text="cobot2_ws FSM 연동",
+            variable=self.pick_bridge_var,
+        )
+        self.pick_bridge_check.grid(row=0, column=1, padx=(0, 8))
+
         self.wrist_check = ttk.Checkbutton(
             controls, text="손목 파지 (GraspGenX)", variable=self.wrist_grasp_var
         )
-        self.wrist_check.grid(row=0, column=1, padx=(0, 8))
+        self.wrist_check.grid(row=0, column=2, padx=(0, 8))
 
         self.pipeline_button = ttk.Button(
             controls, text="VLA 시작", command=self.toggle_pipeline
         )
-        self.pipeline_button.grid(row=0, column=2)
+        self.pipeline_button.grid(row=0, column=3)
 
         # ------------------------------------------------- left: perception
 
@@ -944,7 +959,13 @@ class VLAApp:
         # 경로 자체가 없다(cobot2_ws pick_fsm이 전담, 위 "제거" 주석 참고). motion_enabled
         # 인자도 그래서 안 보낸다: vla_robot 자체가 안 뜨니 값을 줘도 아무 효과가 없다.
         wrist_grasp = bool(self.wrist_grasp_var.get())
+        pick_bridge = bool(self.pick_bridge_var.get())
         command = BASE_LAUNCH_COMMAND + [
+            f"enable_pick_bridge:={'true' if pick_bridge else 'false'}",
+            # pick_bridge 켜짐 = cobot2_ws 쪽 launch가 카메라를 이미 잡고 있다는 전제
+            # (README §4) -- 여기서 또 열면 V4L2 충돌 위험. 꺼짐 = 이 ws 단독 실행이니
+            # 이 ws가 카메라를 연다(예전 기본값).
+            f"enable_realsense:={'false' if pick_bridge else 'true'}",
             f"enable_wrist_grasp:={'true' if wrist_grasp else 'false'}",
         ]
         try:
@@ -970,9 +991,17 @@ class VLAApp:
         self.pipeline_process = process
         self.pipeline_button.configure(text="VLA 정지")
         self.wrist_check.configure(state="disabled")
+        self.pick_bridge_check.configure(state="disabled")
+        mode_note = (
+            " cobot2_ws 연동(pick_bridge) ON -- 이 창의 '전송'/음성 발화가 곧 FSM"
+            " 시작 트리거는 아님, cobot2_ws 쪽 auto_start:=true 또는 /pick/start가"
+            " 별도로 필요함(README §3)."
+            if pick_bridge
+            else " 단독 모드(이 ws 카메라 직접 사용, cobot2_ws 미연동)."
+        )
         self.append_chat(
             "system",
-            f"VLA 파이프라인을 시작했습니다."
+            f"VLA 파이프라인을 시작했습니다.{mode_note}"
             f"{' 손목 파지 ON' if wrist_grasp else ''}"
             f"\n전체 로그: {PIPELINE_LOG_PATH}",
         )
@@ -1044,6 +1073,7 @@ class VLAApp:
 
         self.pipeline_button.configure(text="VLA 시작")
         self.wrist_check.configure(state="normal")
+        self.pick_bridge_check.configure(state="normal")
         self.append_chat("system", "GUI가 시작한 VLA 파이프라인을 정지했습니다.")
 
     # ------------------------------------------------------------- refresh
@@ -1071,6 +1101,7 @@ class VLAApp:
                 self.pipeline_process = None
                 self.pipeline_button.configure(text="VLA 시작")
                 self.wrist_check.configure(state="normal")
+                self.pick_bridge_check.configure(state="normal")
                 self.append_chat("system", f"VLA launch 종료: returncode={payload}")
 
         self.root.after(30, self._drain_events)

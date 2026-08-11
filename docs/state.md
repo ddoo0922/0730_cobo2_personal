@@ -72,6 +72,24 @@ abort 전달까지 왕복 스모크 확인.
   - `holding_object_id`/`class`를 못 채움 — `/vla/pick_result`엔 그 정보가 없음. 필요하면 cobot2_ws `/pick/state`(VERIFY/LIFT/PLACE) 구독을 추가해야 함(안 함)
   - `승인` 관련 툴/경로 없음 — 의도적(아래 표)
 
+### ✅ GUI 기본값을 cobot2_ws 연동으로 전환 (2026-08-11)
+
+`vla_gui.py`에 "cobot2_ws FSM 연동" 체크박스 추가, **기본 켜짐**(`pick_bridge_var =
+True`). 켜진 채로 "VLA 시작"을 누르면 `enable_pick_bridge:=true` +
+`enable_realsense:=false`(카메라는 cobot2_ws 쪽 launch가 이미 잡고 있다는 전제,
+README §4)를 같이 보낸다. 꺼야만 예전 기본 동작(이 ws가 카메라 직접 열고
+`enable_robot`/`pick_bridge` 모두 꺼진 단독 모드)으로 돌아간다. `enable_robot`은
+여전히 GUI에서 켤 방법이 없음(변경 없음). 파이프라인 시작 로그에 어느 모드인지
+채팅으로 표시하도록 추가. 빌드 PASS, `check.sh` 278 passed.
+
+**중요**: 이 변경은 "UI + launch 하나"까지만 자동화한다 — `enable_pick_bridge:=true`
+만으로는 cobot2_ws의 `pick_fsm`이 자동으로 돌지 않는다(§3/§4에서 이미 문서화된
+`auto_start`/`/pick/start` 제약 그대로 유효, 이 세션에서 새로 검증한 것 아님).
+**GUI+pick_bridge 조합의 실기 왕복 테스트는 아직 안 함** — 다음에 테스트할 때
+`ROS_DOMAIN_ID`를 cobot2_ws 기본값(93)이 아닌 별도 도메인에서 먼저 해보라는
+사용자 요청 있었음(2026-08-11) — 이유는 대화에 명시 안 됨, 아마 실제 cobot2_ws
+프로세스와 충돌 없이 GUI 동작만 먼저 확인하려는 의도로 추정.
+
 ### ✅ 카메라 토픽 구독 전환 + `pixel`/`pixel_wh` 전송 시작 (2026-08-11)
 
 **카메라**: `vla_perception`이 `cv2.VideoCapture(webcam_device)` 직접 오픈 대신

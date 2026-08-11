@@ -374,8 +374,14 @@ source scripts/env.sh
 ros2 run vla_system vla_gui
 ```
 
-GUI에서 **VLA 시작**을 누르면 파이프라인이 뜬다. RealSense를 이미 다른 곳에서
-돌리고 있다면 터미널에서 직접:
+GUI에서 **VLA 시작**을 누르면 파이프라인이 뜬다. 🔴 **2026-08-11부터 GUI의
+"cobot2_ws FSM 연동" 체크박스가 기본 켜짐이다** — 켜진 채로 시작하면
+`enable_pick_bridge:=true` + `enable_realsense:=false`(카메라는 cobot2_ws 쪽
+launch가 이미 잡고 있다는 전제, 아래 §3/§4)를 같이 보낸다. 이 ws 카메라로 완전히
+혼자 돌리고 싶을 때만(예: cobot2_ws 없이 대화·인식 로직만 테스트) 체크를 끈다 — 그
+러면 예전 기본값(`enable_realsense:=true`, pick_bridge 꺼짐)으로 돌아간다.
+
+터미널에서 직접 띄우고 싶으면(GUI 없이):
 
 ```bash
 ros2 launch vla_system vla_system.launch.py enable_realsense:=false
@@ -432,9 +438,16 @@ ROS 레벨이 아니라 장비 레벨 충돌이라 에러 없이 조용히 오�
 ros2 launch vla_system vla_system.launch.py enable_pick_bridge:=true
 ```
 
+GUI로 켜면 이 인자를 직접 넘길 필요 없다 — "cobot2_ws FSM 연동" 체크박스가
+기본 켜짐이라 **GUI + VLA 시작 버튼 한 번**이 위 launch와 같은 조합
+(`enable_pick_bridge:=true enable_realsense:=false`)을 대신 실행한다(위 1절).
+
 🔴 **`enable_robot:=true`와 절대 같이 켜지 않는다** — 둘 다 `/vla/robot/action`을
 구독하고 `/vla/robot/state`를 발행해서 경합한다. `vla_pick_bridge`는 기본값이
-`false`다.
+`false`다(GUI에서 이 인자를 켜는 경로 자체가 없으니 GUI로는 이 문제가 안 생긴다).
+
+🔴 **이걸로 "UI + launch 하나"까지는 맞지만, 그것만으로 FSM이 자동으로 돌지는
+않는다** — 바로 아래 항목 참고.
 
 #### 🔴 `enable_pick_bridge:=true`만으로는 cobot2_ws의 FSM 사이클이 시작되지 않는다
 
@@ -477,6 +490,39 @@ cobot2_ws 세션에서 `auto_start:=true` + `vla_pick_bridge`를 같이 띄워 �
 - `allowed_classes`(cobot2_ws가 인식하는 클래스 목록)와 이 ws YOLO의
   `target_classes`가 이름 단위로 안 맞으면 일부 클래스는 즉시 거부된다. 두 YOLO를
   맞출지는 아직 미정 — 지금은 손대지 않았다.
+
+### 4. FSM 연동 최소 명령 (RealSense는 별도 launch로 이미 떠 있다는 전제)
+
+cobot2_ws `pick_fsm`과 실제로 물려서 돌릴 때 **이 ws에서** 실행해야 하는 명령만
+모았다. `enable_realsense:=false`로 이 ws가 카메라를 또 열지 않게 한다 — 이미 다른
+launch가 물리 D435i를 잡고 있으므로 겹쳐 열면 V4L2 충돌 위험이 있다(위 "카메라
+구성" 참고).
+
+```bash
+source scripts/env.sh
+DOOSAN_SETUP=~/cobot2_ws/install/setup.bash ./scripts/build.sh   # 코드를 고쳤을 때만
+ros2 launch vla_system vla_system.launch.py \
+  enable_realsense:=false \
+  enable_robot:=false \
+  enable_pick_bridge:=true
+```
+
+- `enable_realsense:=false` — RealSense는 다른 launch가 띄운다. 여기서 또 켜면 안 됨.
+- `enable_robot:=false` — 로봇 실행은 cobot2_ws `pick_fsm`이 전담. 켜면 `vla_pick_bridge`와
+  `/vla/robot/action`·`/vla/robot/state`를 놓고 경합한다(절대 동시에 켜지 않음).
+- `enable_pick_bridge:=true` — `object_id`→`class` 변환 후 `/vla/pick_command`로
+  cobot2_ws에 넘기고 `/vla/pick_result`를 되돌리는 역할.
+- `ROS_DOMAIN_ID`를 cobot2_ws 쪽과 반드시 맞춘다(기본값이 서로 다르다) — 아래 "검증
+  상태" 참고.
+
+이것만으로 cobot2_ws FSM이 자동으로 돌지는 않는다 — `pick_fsm`은 `IDLE`에서
+`/pick/start`를 기다린다(사람이 rqt로 누르거나, cobot2_ws 쪽에서
+`vla_command.launch.py auto_start:=true`로 띄워야 함, 아래 §3 하단 참고). 이 ws에서
+`auto_start`를 대신 켤 방법은 없다 — 다른 clone/프로세스다.
+
+DOOSAN_SETUP 기본값(`~/cobot_ws/install/setup.bash`)은 이 머신에 없다 — 실제 overlay는
+`~/cobot2_ws/install/setup.bash`다(2026-08-11 확인). `scripts/env.sh`/`scripts/build.sh`를
+쓸 때 위처럼 명시적으로 넘긴다.
 
 ## 설정
 
