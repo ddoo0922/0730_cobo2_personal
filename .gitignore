@@ -26,3 +26,8 @@ runs/
 .vscode/
 .idea/
 .DS_Store
+
+# API 키. 여기 없으면 git add -A 한 번에 딸려 올라간다.
+# .env.example 은 형식만 담으므로 추적한다.
+.env
+!.env.example
