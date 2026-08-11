@@ -33,8 +33,7 @@ def gui_arguments(**flags) -> dict[str, str]:
     return dict(part.split(":=", 1) for part in command if ":=" in part)
 
 
-ALL_ON = {"pick_bridge": True, "wrist_grasp": True,
-          "skill_tier": True, "perception": True}
+ALL_ON = {"pick_bridge": True, "skill_tier": True, "perception": True}
 ALL_OFF = {key: False for key in ALL_ON}
 
 
@@ -71,10 +70,15 @@ def test_every_argument_the_gui_sends_is_one_the_launch_file_declares():
 
 
 def test_the_launch_file_forwards_the_rule_flag_into_the_agent():
-    """선언만 하고 Node(parameters=[])에 안 넘기면 값이 사라진다 -- 실제로 그랬다."""
+    """선언만 하고 Node(parameters=[])에 안 넘기면 값이 사라진다 -- 실제로 그랬다.
+
+    ``Node(`` 사이의 글자를 세지 않고 파일 끝까지 훑는 이유: 노드가 추가되거나
+    삭제되면(2026-08-11 병합에서 robot_node·wrist_grasp_node가 사라졌다) 구분자에
+    기대던 파싱이 검정 자체를 깨뜨린다. 배선이 멀쩡한데 빨간 줄이 뜨는 검정은
+    다음 사람이 지워버린다.
+    """
     source = LAUNCH_FILE.read_text(encoding="utf-8")
     agent = source[source.index('executable="agent_node"'):]
-    agent = agent[:agent.index("),\n            Node(")]
     assert '"skill_tier_enabled": skill_tier_enabled' in agent
     assert '"rule_store_path": rule_store_path' in agent
 

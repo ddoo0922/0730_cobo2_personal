@@ -9,8 +9,6 @@ class ToolSchemaTest(unittest.TestCase):
     def test_every_tool_the_plan_calls_for_exists(self):
         expected = {
             "pick_and_place",
-            "pick_and_hold",
-            "release",
             "cancel_current_action",
             "ask_clarification",
             "wait",
@@ -47,7 +45,7 @@ class ToolSchemaTest(unittest.TestCase):
 
     def test_picking_tools_take_an_object_handle(self):
         for tool in TOOLS:
-            if tool["name"] in ("pick_and_place", "pick_and_hold"):
+            if tool["name"] == "pick_and_place":
                 self.assertIn("object_id", tool["parameters"]["properties"])
 
     def test_every_tool_carries_a_sentence_for_the_user(self):

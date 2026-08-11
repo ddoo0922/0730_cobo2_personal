@@ -65,14 +65,19 @@ python3 -m pip install "setuptools<80,>=30.3.0" "packaging>=23"
 `vla_pick_bridge_node`의 `allow_unverified_place`(기본 false)로 막혀 있다 — teach 끝나면
 그 파라미터만 뒤집는다, 코드는 안 건드린다.
 
-🔴 **`pick_and_hold`/`release` 툴은 제거하지 않는다 — 2026-08-11 정정.** 예전 노트가
-"cobot2_ws가 못 받으니 프롬프트에서 지우는 게 맞다"고 했던 건 `vla_pick_bridge`
-관점만 본 반쪽 결론이었다. `agent/tools.py`는 `enable_robot`(단독 모드)과
-`enable_pick_bridge`(cobot2_ws 연동) 양쪽이 **공유**하는데, `robot_node.py`
-(단독 모드)에서 `pick_and_hold`/`release`는 실제로 동작하는 기능이다(`PICK_ACTIONS`,
-`self.holding` 상태로 "쥔 채 대기" → 나중에 `release`). 지우면 cobot2_ws 연동 모드의
-UX만 좋아지고 단독 모드의 실기능 하나가 없어진다. 지금처럼 스키마엔 남겨두고
-`vla_pick_bridge`가 로컬에서 거부하는 현재 구조가 맞다 — 손대지 않는다.
+🔴 **`robot_node.py`(단독 모드)와 `wrist_grasp_node.py`/`grasp/*`/`robot/*` 전체 삭제
+— 2026-08-11 재정정, 2026-08-11 정정을 다시 뒤집음.** 그 정정은 "`pick_and_hold`/
+`release`가 단독 모드(`robot_node.py`)에서 실기능이니 스키마에 남긴다"였다. 그런데
+`vla_gui.py`가 이미 그날 `enable_robot:=true`를 보내는 경로 자체를 없앴다(GUI
+체크박스는 그 전부터 죽어 있었다) — 즉 단독 모드는 코드로만 존재했지 실제로 뜬 적이
+없었다. cobot2_ws의 `pick_fsm`이 로봇/그리퍼를 전담하는 아키텍처를 최종으로 확정하면서
+`robot_node.py`/`robot/moves.py`/`robot/gripper.py`와, 그 유일한 소비자였던
+`wrist_grasp_node.py`/`grasp/graspgen_client.py`/`grasp/poses.py`/
+`perception/wrist_geometry.py`/`perception/wrist_tracking.py`를 전부 삭제했다(사용자
+승인, 2026-08-11). `agent/tools.py`의 `pick_and_hold`/`release`도 함께 제거 —
+소비자(`robot_node.py`)가 없으니 순수 죽은 코드였다. **이제 `vla_pick_bridge_node`가
+유일한 실행 주체다.** `perception_node.py`/`table_homography*.py`는 명령 실행에 안
+쓰이는(GUI 디버그 표시용) 정보라 남겨뒀다.
 
 남은 것: `vla_pick_bridge`↔cobot2_ws 실기 왕복 스모크(특히 `place` 거부 경로
 미검증). 그 외엔 `docs/state.md` "확인/결정이 안 끝난 것" 절 참고 — 대부분 사용자
@@ -91,10 +96,10 @@ M0609 + OnRobot RG2. **고정 카메라는 별도 Logitech C270가 아니라, co
 **틀렸다** — cobot2_ws CLAUDE.md 2절의 "D435i는 그쪽 로봇 전용, 이 ws와 다른 카메라"
 서술도 함께 틀렸다는 뜻이니 그쪽을 참고할 때도 이 사실을 우선한다.
 
-**손목(wrist) RealSense D435i 구성은 아직 미정이다.** README의 "고정 웹캠=탐지, 손목
-RealSense=파지 정밀화" 투-카메라 설계가 지금도 유효한지 자체가 불확실 — `vla_wrist`,
-GraspGenX 경로, hand-eye 보정 관련 작업을 시작하기 전에 반드시 먼저 확인할 것.
-상세·후속 확인 목록은 `docs/context/constraints.md` "카메라 구성" 항목.
+**손목(wrist) RealSense 경로는 삭제했다 (2026-08-11).** `vla_wrist`/`wrist_grasp_node`/
+GraspGenX/hand-eye 보정 코드는 §3에 적힌 대로 이 ws에서 완전히 제거됐다 — 손목
+카메라로 정밀 파지 포즈를 계산하는 건 이제 이 ws의 일이 아니다(cobot2_ws의
+`grasp_bridge_node`가 자기 쪽에서 처리). 고정 D435i(`vla_perception`)만 남는다.
 
 두 프로세스(vla_perception, cobot2_ws FSM)가 물리 카메라 하나를 어떻게 나눠 쓰는지
 (토픽 공유 vs 각자 독립 오픈)도 미확인 — 독립 오픈이면 V4L2 장치 충돌 가능성이 있다.

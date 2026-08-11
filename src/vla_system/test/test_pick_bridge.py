@@ -3,14 +3,15 @@
 import unittest
 
 from vla_system.bridge.pick_bridge import (
+    FSM_HOLDING_STATES,
     PLACE_VALUES,
-    UNSUPPORTED_ACTIONS,
     UNVERIFIED_PLACE_VALUES,
     bbox_center,
     build_abort_command,
     build_pick_command,
     find_class_name,
     find_scene_object,
+    fsm_state_view,
     parse_pick_result,
     place_rejection_reason,
     result_update,
@@ -196,10 +197,35 @@ class ResultUpdateTest(unittest.TestCase):
         self.assertEqual((update.terminal, update.status, update.last_result), (True, "idle", "failed"))
 
 
-class UnsupportedActionsTest(unittest.TestCase):
-    def test_pick_and_hold_and_release_are_flagged(self):
-        self.assertIn("pick_and_hold", UNSUPPORTED_ACTIONS)
-        self.assertIn("release", UNSUPPORTED_ACTIONS)
+class FsmStateViewTest(unittest.TestCase):
+    def test_holding_states_report_holding(self):
+        for name in ("VERIFY", "LIFT", "PLACE", "PLACE_RETRY"):
+            self.assertTrue(fsm_state_view(name).holding, name)
+
+    def test_non_holding_state_does_not_report_holding(self):
+        for name in ("APPROACH", "DESCEND", "HOME", "IDLE"):
+            self.assertFalse(fsm_state_view(name).holding, name)
+
+    def test_holding_set_matches_the_states_that_report_holding(self):
+        self.assertEqual(FSM_HOLDING_STATES, {"VERIFY", "LIFT", "PLACE", "PLACE_RETRY"})
+
+    def test_wait_approval_is_its_own_status(self):
+        self.assertEqual(fsm_state_view("WAIT_APPROVAL").status, "waiting_approval")
+
+    def test_known_states_map_to_documented_status_vocab(self):
+        allowed = {"idle", "moving", "holding", "waiting_approval", "error"}
+        for name in ("IDLE", "APPROACH", "LIFT", "WAIT_APPROVAL", "SAFE_STOP"):
+            self.assertIn(fsm_state_view(name).status, allowed, name)
+
+    def test_unknown_state_falls_through_to_moving_with_raw_label(self):
+        view = fsm_state_view("SOME_NEW_STATE")
+        self.assertEqual(view.status, "moving")
+        self.assertEqual(view.label, "SOME_NEW_STATE")
+        self.assertFalse(view.holding)
+
+    def test_every_state_has_a_nonempty_label(self):
+        for name in ("IDLE", "LIFT", "WAIT_APPROVAL", "HOME"):
+            self.assertTrue(fsm_state_view(name).label.strip(), name)
 
 
 if __name__ == "__main__":

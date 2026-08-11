@@ -11,7 +11,14 @@ level, not nested under ``function``).
 # Actions that hand control to the arm. The agent stops its tool loop after
 # one of these: the next decision point is the action *completing*, which
 # arrives as a robot state event, not as another tool round.
-MOTION_TOOLS = ("pick_and_place", "pick_and_hold", "release")
+#
+# pick_and_place only: cobot2_ws's pick_fsm always carries a pick through to
+# place -- there is no "hold it and wait" or "put it down right here" on that
+# side (vla-bridge-contract.md #7), so pick_and_hold/release had nowhere to
+# go. They used to stay in the schema for vla_robot's own standalone arm
+# control, but that path (robot_node.py) is gone now that cobot2_ws's pick_fsm
+# is the only executor -- see CLAUDE.md #3.
+MOTION_TOOLS = ("pick_and_place",)
 
 # Actions that end the turn without moving anything.
 TERMINAL_TOOLS = ("ask_clarification", "wait")
@@ -29,21 +36,6 @@ def _say_argument(description: str) -> dict:
         "type": "object",
         "properties": {"say": {"type": "string", "description": description}},
         "required": ["say"],
-        "additionalProperties": False,
-    }
-
-
-def _object_argument(description: str) -> dict:
-    return {
-        "type": "object",
-        "properties": {
-            "object_id": {"type": "string", "description": description},
-            "say": {
-                "type": "string",
-                "description": "무엇을 왜 집는지 사용자에게 할 한 문장. 그대로 들린다.",
-            },
-        },
-        "required": ["object_id", "say"],
         "additionalProperties": False,
     }
 
@@ -94,28 +86,6 @@ TOOLS = [
             "기회가 주어진다."
         ),
         "parameters": _pick_and_place_argument(),
-        "strict": True,
-    },
-    {
-        "type": "function",
-        "name": "pick_and_hold",
-        "description": (
-            "지정한 물체를 집어서 든 채로 대기한다. 사용자가 직접 건네받으려 하거나 "
-            "담을지 말지 아직 정하지 않았을 때 쓴다."
-        ),
-        "parameters": _object_argument(
-            "scene의 visible_objects에 있는 id를 그대로 쓴다. 예: apple_17"
-        ),
-        "strict": True,
-    },
-    {
-        "type": "function",
-        "name": "release",
-        "description": (
-            "지금 들고 있는 물체를 현재 위치에서 놓는다. robot_state.holding이 "
-            "비어 있으면 호출하지 마라."
-        ),
-        "parameters": _say_argument("무엇을 왜 내려놓는지 사용자에게 할 한 문장."),
         "strict": True,
     },
     {

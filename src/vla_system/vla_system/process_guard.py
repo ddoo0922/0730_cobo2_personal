@@ -7,8 +7,8 @@ once the signal and liveness calls are injected.
 Why it exists at all: closing or killing the GUI does not stop the ``ros2
 launch`` subprocess it started -- there is no OS-level parent-death link back to
 the GUI -- so a fresh GUI has no memory of the previous run and would happily
-launch a second full pipeline. A second ``robot_node`` means two executors
-sending different motions to the same physical arm.
+launch a second full pipeline. Two ``vla_pick_bridge_node``s means two
+executors sending cobot2_ws different ideas of what to pick.
 """
 
 import os
@@ -20,17 +20,30 @@ import time
 # Matches this pipeline's node executables and the launch process itself. It
 # deliberately does not match `vla_gui`, which must survive its own cleanup.
 #
-# realsense2_camera_node is included even though it is not ours, because our
-# launch file starts one and there is exactly one physical camera. Leaving a
-# stale one alive does not merely waste a process: the new node's attempt to
-# claim the device resets the USB connection, the old node reports "device has
-# been disconnected", and the new one dies on "Device or resource busy". Two
-# RealSense nodes can never usefully coexist, so cleanup has to take it.
-EXISTING_PIPELINE_PATTERN = (
+# robot_node/wrist_grasp_node were removed (CLAUDE.md #3, cobot2_ws's pick_fsm
+# is the sole executor now) so they are gone from this pattern too --
+# vla_pick_bridge_node is the only thing left that can race another instance
+# of itself over /vla/robot/action and /vla/pick_command.
+PIPELINE_PATTERN = (
     r"ros2 launch vla_system vla_system\.launch\.py"
-    r"|vla_system/lib/vla_system/(perception_node|agent_node|robot_node)"
-    r"|realsense2_camera/realsense2_camera_node"
+    r"|vla_system/lib/vla_system/(perception_node|agent_node|vla_pick_bridge_node)"
 )
+
+# Split out from PIPELINE_PATTERN (2026-08-11) so the GUI can leave someone
+# else's RealSense process alone when it is not about to need the device
+# itself (cobot2_ws-integration mode always launches with
+# enable_realsense:=false -- see vla_gui.py's `_clear_leftover_pipeline`).
+#
+# realsense2_camera_node is not one of our nodes, but our launch file starts
+# one and there is exactly one physical camera. Leaving a stale one alive does
+# not merely waste a process: the new node's attempt to claim the device
+# resets the USB connection, the old node reports "device has been
+# disconnected", and the new one dies on "Device or resource busy". Two
+# RealSense nodes can never usefully coexist -- but only when *we* are the one
+# about to open it.
+REALSENSE_PATTERN = r"realsense2_camera/realsense2_camera_node"
+
+EXISTING_PIPELINE_PATTERN = f"{PIPELINE_PATTERN}|{REALSENSE_PATTERN}"
 
 # Every start clears leftovers, so the escalation has to finish quickly enough
 # that the window does not look hung. SIGINT is where rclpy shuts down cleanly

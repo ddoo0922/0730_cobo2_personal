@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """Hands agent decisions to cobot2_ws's pick_fsm and reflects its results back.
 
-This node takes over ``vla_robot``'s ROS-facing role -- it subscribes
-``/vla/robot/action``/``/vla/robot/stop``/``/vla/estop`` and publishes
-``/vla/robot/state``, exactly like ``robot_node.py`` -- but instead of moving
-an arm it forwards to a *different process in a different git clone*
-(``~/cobot2_ws``'s ``vla_command_node``) over ``/vla/pick_command`` /
-``/vla/pick_result`` (``std_msgs/String``, JSON). See
-``docs/state.md`` "cobot2_ws 통합" for the full checklist this implements, and
-``~/cobot2_ws/md/vla-bridge-contract.md`` for the schema this node is bound
-by (not copied here on purpose -- CLAUDE.md #2).
-
-🔴 Mutually exclusive with ``vla_robot`` (``enable_robot:=true``): both
-subscribe the same action/stop topics and publish the same state topic. Two
-processes racing to answer ``/vla/robot/action`` is not a supported
-configuration -- launch one or the other, never both.
+This node is the only executor left in this ws (``robot_node.py`` and its own
+Doosan/gripper control were removed -- cobot2_ws's ``pick_fsm`` is the sole
+robot/gripper owner now, CLAUDE.md #3). It subscribes ``/vla/robot/action``/
+``/vla/robot/stop``/``/vla/estop`` and publishes ``/vla/robot/state``, and
+forwards to a *different process in a different git clone* (``~/cobot2_ws``'s
+``vla_command_node``) over ``/vla/pick_command`` / ``/vla/pick_result``
+(``std_msgs/String``, JSON). See ``docs/state.md`` "cobot2_ws 통합" for the
+full checklist this implements, and ``~/cobot2_ws/md/vla-bridge-contract.md``
+for the schema this node is bound by (not copied here on purpose --
+CLAUDE.md #2).
 
 What this node deliberately does not do:
 
@@ -31,7 +27,8 @@ What this node deliberately does not do:
   this bridge does not try to route around that (contract #4).
 - **``pick_and_hold``/``release``.** cobot2_ws's FSM always carries a pick
   through to place; there is no "hold it" or "put it down here" on that side.
-  Both are rejected locally before anything is published.
+  Not a rejection this node has to do anymore -- ``agent/tools.py`` no longer
+  offers either tool to the model.
 """
 
 import json
@@ -47,11 +44,11 @@ from std_msgs.msg import String
 from vla_interfaces.msg import RobotAction, RobotState, SceneSnapshot
 
 from vla_system.bridge.pick_bridge import (
-    UNSUPPORTED_ACTIONS,
     bbox_center,
     build_abort_command,
     build_pick_command,
     find_scene_object,
+    fsm_state_view,
     parse_pick_result,
     place_rejection_reason,
     result_update,
@@ -72,6 +69,11 @@ class PickBridgeNode(Node):
         # defaults exactly (voice_processing/vla_command_node.py).
         self.declare_parameter("pick_command_topic", "/vla/pick_command")
         self.declare_parameter("pick_result_topic", "/vla/pick_result")
+        # cobot2_ws's pick_fsm publishes its live State enum name here on every
+        # transition (task_manager.py, std_msgs/String). Subscribed so the GUI
+        # can show which step the arm is in -- see
+        # docs/context/fsm-state-integration.md.
+        self.declare_parameter("fsm_state_topic", "/pick/state")
         self.declare_parameter("max_scene_age_s", 2.0)
         # cobot2_ws's own wait_timeout_sec default is 50s (vla_command_node);
         # stay above it so a slow-but-real answer is never mistaken for a
@@ -106,12 +108,20 @@ class PickBridgeNode(Node):
         self.pending_request_id = ""
         self.pending_action: RobotAction | None = None
         self.pending_sent_monotonic = 0.0
+        # Class of the pending pick, captured at send time so a HOLDING_STATES
+        # /pick/state can fill RobotState.holding without cobot2_ws sending it
+        # (contract §3 leaves holding out of /vla/pick_result).
+        self.pending_class_name = ""
 
         self.status = "idle"
         self.last_action_id = ""
         self.last_action = ""
         self.last_result = ""
         self.details = ""
+        # Populated from the pending pick while /pick/state says the gripper is
+        # holding (FSM_HOLDING_STATES); cleared on any terminal/reject/timeout.
+        self.holding_object_id = ""
+        self.holding_class_name = ""
 
         # RobotAction.header.stamp is when the agent read the world, not when
         # it finished thinking -- an LLM round-trip is seconds long, so a
@@ -165,6 +175,14 @@ class PickBridgeNode(Node):
             self.action_callback,
             command_qos,
         )
+        # Live FSM step. Same command_qos (RELIABLE/VOLATILE/depth 10) as
+        # task_manager's default publisher -- a mismatch here means silence.
+        self.create_subscription(
+            String,
+            str(self.get_parameter("fsm_state_topic").value),
+            self.fsm_state_callback,
+            command_qos,
+        )
         # Two topics, one handler -- same split as vla_robot's for the same
         # reason: /vla/estop is the GUI's hardcoded keyword path, /vla/robot/
         # stop is the agent's cancel_current_action.
@@ -194,9 +212,6 @@ class PickBridgeNode(Node):
     def action_callback(self, message: RobotAction) -> None:
         name = message.name.strip()
 
-        if name in UNSUPPORTED_ACTIONS:
-            self.reject(message, UNSUPPORTED_ACTIONS[name])
-            return
         if name != "pick_and_place":
             self.reject(message, f"알 수 없는 동작입니다: {name}")
             return
@@ -262,6 +277,7 @@ class PickBridgeNode(Node):
         )
         self.pending_request_id = message.action_id
         self.pending_action = message
+        self.pending_class_name = class_name
         self.pending_sent_monotonic = time.monotonic()
         self.pick_command_publisher.publish(
             String(data=json.dumps(payload, ensure_ascii=False))
@@ -301,6 +317,30 @@ class PickBridgeNode(Node):
         # actually happened to it -- inventing "cancelled" ahead of that
         # would be a guess this path is not allowed to make either.
 
+    def fsm_state_callback(self, message: String) -> None:
+        """cobot2_ws's live FSM step -> RobotState, for GUI visibility only.
+
+        Published with current_action still set and last_result empty on
+        purpose: agent_node's robot_state_callback drops any state where
+        current_action is set (``if not last_result or current_action:
+        return``), so these updates reach the GUI without waking the agent for
+        a fresh decision. The decision point stays the terminal
+        /vla/pick_result. Ignored entirely when no pick is in flight -- a late
+        HOME after a concluded pick must not resurrect stale status.
+        """
+        if self.pending_action is None:
+            return
+        view = fsm_state_view(message.data.strip())
+        self.status = view.status
+        self.details = view.label
+        if view.holding:
+            self.holding_object_id = self.pending_action.object_id
+            self.holding_class_name = self.pending_class_name
+        else:
+            self.holding_object_id = ""
+            self.holding_class_name = ""
+        self.publish_state()
+
     def pick_result_callback(self, message: String) -> None:
         doc = parse_pick_result(message.data)
         if doc is None:
@@ -327,6 +367,9 @@ class PickBridgeNode(Node):
         self.pending_request_id = ""
         self.pending_action = None
         self.pending_sent_monotonic = 0.0
+        self.pending_class_name = ""
+        self.holding_object_id = ""
+        self.holding_class_name = ""
         self.status = update.status
         self.last_action_id = action.action_id if action else self.last_action_id
         self.last_action = action.name if action else self.last_action
@@ -348,6 +391,9 @@ class PickBridgeNode(Node):
         self.pending_request_id = ""
         self.pending_action = None
         self.pending_sent_monotonic = 0.0
+        self.pending_class_name = ""
+        self.holding_object_id = ""
+        self.holding_class_name = ""
         self.status = "idle"
         self.last_action_id = action.action_id
         self.last_action = action.name
@@ -359,6 +405,8 @@ class PickBridgeNode(Node):
 
     def reject(self, action: RobotAction, reason: str) -> None:
         self.get_logger().warning(f"action rejected ({action.name}): {reason}")
+        self.holding_object_id = ""
+        self.holding_class_name = ""
         self.last_action_id = action.action_id
         self.last_action = action.name
         self.last_result = "rejected"
@@ -370,13 +418,13 @@ class PickBridgeNode(Node):
         message.header.stamp = self.get_clock().now().to_msg()
         message.header.frame_id = "base"
         message.status = self.status
-        # cobot2_ws's /vla/pick_result carries no "what is the gripper
-        # holding" field (vla-bridge-contract.md #3), so this bridge cannot
-        # populate holding_object_id/holding_class_name -- see docs/state.md
-        # "cobot2_ws 통합" for the open question this leaves (subscribing
-        # cobot2_ws's /pick/state for VERIFY/LIFT/PLACE would close it).
-        message.holding_object_id = ""
-        message.holding_class_name = ""
+        # cobot2_ws's /vla/pick_result carries no holding field
+        # (vla-bridge-contract.md #3). These are filled instead from the
+        # pending pick while /pick/state reports a HOLDING_STATES step, and
+        # cleared on any terminal/reject/timeout -- see fsm_state_callback and
+        # docs/context/fsm-state-integration.md.
+        message.holding_object_id = self.holding_object_id
+        message.holding_class_name = self.holding_class_name
         message.current_action_id = (
             self.pending_action.action_id if self.pending_action else ""
         )

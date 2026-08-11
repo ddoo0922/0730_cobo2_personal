@@ -17,6 +17,7 @@ import rclpy
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vla_interfaces.msg import RobotState, SceneObject, SceneSnapshot   # noqa: E402
+from vla_system.agent.conversation import scene_to_payload              # noqa: E402
 from vla_system.agent.rules import RuleStore                            # noqa: E402
 from vla_system.agent.skill_tier import SkillTier                       # noqa: E402
 from vla_system.nodes.agent_node import AgentNode                       # noqa: E402
@@ -149,6 +150,29 @@ def test_scene_items_carry_what_the_rules_filter_on():
     assert [i.class_name for i in items] == ["cup", "apple"]
     assert [i.color for i in items] == ["white", "red"]
     assert [i.rank for i in items] == [1, 2]
+    node.destroy_node()
+
+
+def test_both_layers_agree_on_what_can_be_picked():
+    """두 계층이 여기서 갈라지면 아무것도 안 터지고 Tier 1만 조용히 멈춘다.
+
+    2026-08-11 병합에서 실제로 갈라졌다: 대화 경로는 "전부 집을 수 있다"로
+    바뀌었는데(cobot2_ws가 클래스 이름만으로 좌표를 계산한다) 규칙 계층은
+    이 ws의 `position_valid`를 계속 보고 있었다. 테이블 보정이 없는 실기
+    구성에서 Tier 1은 후보를 하나도 못 찾고 "담을 게 없습니다"라고만 한다.
+    """
+    node, _ = build({})
+    snapshot = scene(("cup_1", "cup", "white"), ("apple_2", "apple", "red"))
+    # 이 ws가 3D 위치를 못 잡은 상태 -- cobot2_ws 연동에서는 정상이다.
+    for scene_object in snapshot.objects:
+        scene_object.position_valid = False
+    node.scene = snapshot
+
+    payload = scene_to_payload(snapshot)
+    from_llm = [o["pickable"] for o in payload["visible_objects"]]
+    from_rules = [i.pickable for i in node.scene_items()]
+    assert from_rules == from_llm, (
+        f"두 계층의 pickable이 다르다: 규칙={from_rules} 대화={from_llm}")
     node.destroy_node()
 
 

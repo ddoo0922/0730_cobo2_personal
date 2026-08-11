@@ -1,15 +1,20 @@
-"""Bring up perception and agent. Robot execution is off by default -- cobot2_ws's
-pick_fsm owns the M0609/RG2 hardware; vla_robot and gripper.py must not run
-alongside it (shared DRFL connection / Modbus register, see md/plans/
-2026-08-08-vla-integration.md #5-3 in cobot2_ws). Set enable_robot:=true only
-for this node's own standalone DRY-RUN testing with no cobot2_ws FSM running.
+"""Bring up perception, agent, and the cobot2_ws bridge.
 
-enable_pick_bridge and enable_robot are mutually exclusive: both subscribe
-/vla/robot/action and publish /vla/robot/state, so running both means two
-processes racing to answer the agent. enable_pick_bridge is the integration
-path (forwards to cobot2_ws's pick_fsm over /vla/pick_command); enable_robot
-is this node's own standalone arm control, off by default for the reason
-above."""
+This ws no longer owns any robot/gripper execution -- robot_node.py (its own
+Doosan/gripper control) and wrist_grasp_node.py (GraspGenX precision grasp,
+whose only consumer was robot_node) were removed once cobot2_ws's pick_fsm
+became the sole executor (CLAUDE.md #3). vla_pick_bridge_node is now the only
+thing that turns an agent decision into a motion, by forwarding to pick_fsm
+over /vla/pick_command -- it never moves an arm itself.
+
+enable_pick_bridge defaults off here so a bare launch (e.g. running tests, or
+perception-only debugging) never fires a command at cobot2_ws by accident;
+turn it on deliberately when cobot2_ws's pick_fsm is actually up. This alone
+does not start pick_fsm's cycle either: it sits in IDLE until /pick/start is
+called (a human button, or cobot2_ws's own vla_command_node with
+auto_start:=true -- a different launch file in a different clone, not started
+from here). See README.md #3 "enable_pick_bridge:=true만으로는...".
+"""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
@@ -25,9 +30,6 @@ def generate_launch_description():
     enable_realsense = LaunchConfiguration("enable_realsense")
     enable_perception = LaunchConfiguration("enable_perception")
     enable_agent = LaunchConfiguration("enable_agent")
-    motion_enabled = LaunchConfiguration("motion_enabled")
-    enable_wrist_grasp = LaunchConfiguration("enable_wrist_grasp")
-    enable_robot = LaunchConfiguration("enable_robot")
     enable_pick_bridge = LaunchConfiguration("enable_pick_bridge")
     skill_tier_enabled = LaunchConfiguration("skill_tier_enabled")
     rule_store_path = LaunchConfiguration("rule_store_path")
@@ -43,12 +45,11 @@ def generate_launch_description():
                         [FindPackageShare("realsense2_camera"), "launch", "rs_launch.py"]
                     )
                 ),
-                # The RealSense is on the wrist now and nothing in the pipeline
-                # reads it -- perception runs off the fixed webcam, and the GUI
-                # only displays this colour stream. Depth stays on for the
-                # wrist-guided grasping still to come, but the pointcloud is
-                # dropped: nobody subscribed to it, and it shares a USB
-                # controller with the webcam.
+                # cobot2_ws's pick_fsm shares this same physical D435i when
+                # enable_pick_bridge is on -- see start_pipeline() in vla_gui.py,
+                # which pairs enable_pick_bridge:=true with
+                # enable_realsense:=false so this ws never opens a second V4L2
+                # handle onto a camera cobot2_ws's own launch already owns.
                 launch_arguments={
                     "enable_color": "true",
                     "enable_depth": "true",
@@ -77,11 +78,6 @@ def generate_launch_description():
             # 볼 때). 둘을 동시에 띄우면 같은 토픽에 둘이 발행해 서로 덮는다.
             DeclareLaunchArgument("enable_perception", default_value="true"),
             DeclareLaunchArgument("enable_agent", default_value="true"),
-            DeclareLaunchArgument("motion_enabled", default_value="false"),
-            DeclareLaunchArgument("enable_wrist_grasp", default_value="false"),
-            # Off by default: cobot2_ws's pick_fsm owns the robot/gripper now.
-            # See the launch-time docstring above before flipping this on.
-            DeclareLaunchArgument("enable_robot", default_value="false"),
             # Off by default: the cobot2_ws side of this integration (§9's
             # checklist, docs/state.md "cobot2_ws 통합") still has open
             # questions -- same-PC/domain unconfirmed, approval UX not
@@ -120,34 +116,8 @@ def generate_launch_description():
                     "rule_store_path": rule_store_path,
                 }],
             ),
-            Node(
-                package="vla_system",
-                executable="robot_node",
-                name="vla_robot",
-                output="screen",
-                condition=IfCondition(enable_robot),
-                parameters=[params_file, {"motion_enabled": motion_enabled}],
-            ),
-            # Wrist-guided grasping. Off by default at launch level because it
-            # loads a second YOLO plus GraspGenX (~1.2 GB VRAM) and is only
-            # useful with the RealSense actually mounted on the arm.
-            Node(
-                package="vla_system",
-                executable="wrist_grasp_node",
-                name="vla_wrist",
-                output="screen",
-                condition=IfCondition(enable_wrist_grasp),
-                parameters=[params_file],
-            ),
-            # cobot2_ws integration: forwards RobotAction to pick_fsm instead
-            # of moving an arm here. See the module docstring above --
-            # mutually exclusive with enable_robot.
-            #
-            # This alone does not start cobot2_ws's FSM cycle: pick_fsm sits
-            # in IDLE until /pick/start is called (a human button, or
-            # cobot2_ws's own vla_command_node with auto_start:=true -- a
-            # different launch file in a different clone, not started from
-            # here). See README.md #3 "enable_pick_bridge:=true만으로는...".
+            # The only executor: forwards RobotAction to cobot2_ws's pick_fsm
+            # instead of moving an arm here.
             Node(
                 package="vla_system",
                 executable="vla_pick_bridge_node",

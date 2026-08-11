@@ -33,11 +33,16 @@ else
 fi
 
 # Overlay with the Doosan packages. scripts/build.sh reads DOOSAN_SETUP too.
-export DOOSAN_SETUP="${DOOSAN_SETUP:-$HOME/cobot_ws/install/setup.bash}"
+# This machine's real overlay is ~/cobot2_ws/install/setup.bash (2026-08-11
+# confirmed present). Only table_homography_test needs it now that robot_node/
+# wrist_grasp_node are gone (CLAUDE.md #3) -- the GUI pipeline (perception/
+# agent/pick_bridge) runs fine without it, so a missing overlay is a note,
+# not a hard failure.
+export DOOSAN_SETUP="${DOOSAN_SETUP:-$HOME/cobot2_ws/install/setup.bash}"
 if [[ -f "$DOOSAN_SETUP" ]]; then
   source "$DOOSAN_SETUP"
 else
-  echo "warn: Doosan overlay not found: $DOOSAN_SETUP" >&2
+  echo "note: Doosan overlay not found: $DOOSAN_SETUP (only table_homography_test needs it)" >&2
 fi
 
 # This workspace, once scripts/build.sh has run at least once.
