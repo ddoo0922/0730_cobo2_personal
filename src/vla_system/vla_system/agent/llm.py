@@ -11,6 +11,7 @@ from pathlib import Path
 
 from vla_system.agent.prompt import STT_PROMPT, SYSTEM_PROMPT
 from vla_system.agent.tools import TOOLS
+from vla_system.agent.vision import attach_image
 
 
 @dataclass(frozen=True)
@@ -62,11 +63,16 @@ class AgentLLM:
             raise RuntimeError("STT 결과가 비어 있습니다.")
         return text
 
-    def respond(self, items: list[dict]) -> AgentResponse:
+    def respond(self, items: list[dict], image: str = "") -> AgentResponse:
+        """`image`는 data URL. 이번 호출에만 실리고 기록에는 남지 않는다.
+
+        기록에 넣지 않는 이유는 agent/vision.py 설명에 있다 -- 요약하면, 넣으면
+        지난 사진들이 매 호출마다 따라 올라간다.
+        """
         response = self.client.responses.create(
             model=self.model,
             instructions=SYSTEM_PROMPT,
-            input=items,
+            input=attach_image(items, image) if image else items,
             tools=TOOLS,
         )
         return self._parse(response)

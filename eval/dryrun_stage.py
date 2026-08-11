@@ -10,6 +10,15 @@
 받아 성공했다고 답한다. 판단 계층 입장에서는 카메라와 팔이 붙어 있는 것과
 구분되지 않는다 -- 같은 토픽, 같은 메시지, 같은 순서다.
 
+라벨이 그려진 화면(`/vla/perception/annotated_image`)도 함께 낸다. 그 위에
+**화살표 하나**를 그리는데, 사람이 손으로 가리키는 것의 대역이다. "이거 집어줘"는
+화살표 없이는 시험할 수 없다 -- 그 발화의 뜻이 전부 거기에 있기 때문이다.
+
+    ros2 topic pub --once /dryrun/point_at std_msgs/String "{data: 'cup_4'}"
+
+로 가리키는 대상을 바꾼다. 빈 문자열이면 화살표가 사라지고, 그때 "이거 집어줘"는
+되물어야 맞다(가리키는 것이 없으니 짐작하면 안 된다).
+
 무엇을 흉내내지 않는가
 --------------------
 물리 시간, 파지 실패, 추적 번호 재배정, 30Hz로 흔들리는 장면. 실기에서 처음
@@ -24,9 +33,12 @@ from __future__ import annotations
 import argparse
 import threading
 
+import cv2
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from vla_interfaces.msg import RobotAction, RobotState, SceneObject, SceneSnapshot
 
@@ -39,6 +51,21 @@ TABLE = [
     ("scissors_5", "scissors", "black", 0.46, 0.30),
 ]
 
+FRAME_SIZE = (480, 640)          # 실제 카메라와 같은 크기
+BOX_HALF = 55                    # 박스 반폭(px)
+
+# 색은 BGR. 진짜 인식 결과가 아니라 사람이 화면에서 알아보라고 넣은 것이다.
+SWATCH = {"red": (60, 60, 220), "yellow": (60, 200, 230),
+          "white": (200, 200, 200), "black": (60, 60, 60)}
+
+
+def table_to_pixel(x: float, y: float) -> tuple[int, int]:
+    """로봇 좌표(m) -> 화면 좌표(px). 보기 좋게만 맞춘 가짜 사영이다."""
+    column = int(round(320 - y * 900))
+    row = int(round(1150 - x * 1500))
+    return (max(BOX_HALF, min(FRAME_SIZE[1] - BOX_HALF, column)),
+            max(BOX_HALF, min(FRAME_SIZE[0] - BOX_HALF, row)))
+
 
 def latched(depth: int = 1) -> QoSProfile:
     return QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=depth,
@@ -46,24 +73,37 @@ def latched(depth: int = 1) -> QoSProfile:
                       durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
 
+def stream(depth: int = 1) -> QoSProfile:
+    return QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=depth,
+                      reliability=ReliabilityPolicy.BEST_EFFORT,
+                      durability=DurabilityPolicy.VOLATILE)
+
+
 class Stage(Node):
-    def __init__(self, action_seconds: float) -> None:
+    def __init__(self, action_seconds: float, point_at: str) -> None:
         super().__init__("dryrun_stage")
         self.action_seconds = action_seconds
         self.present = [row[0] for row in TABLE]
         self.holding = ""
+        self.point_at = point_at
         self.lock = threading.Lock()
 
         self.scene_publisher = self.create_publisher(SceneSnapshot, "/vla/scene", latched())
         self.state_publisher = self.create_publisher(RobotState, "/vla/robot/state", latched())
+        # 판단 계층이 이 토픽을 BEST_EFFORT로 잡는다(진짜 perception과 같은 QoS).
+        # 여기서 RELIABLE로 내면 아무 오류 없이 영영 안 만난다.
+        self.image_publisher = self.create_publisher(
+            Image, "/vla/perception/annotated_image", stream())
         self.create_subscription(RobotAction, "/vla/robot/action", self._on_action, 10)
         self.create_subscription(String, "/vla/robot/stop", self._on_stop, 10)
         self.create_subscription(String, "/vla/estop", self._on_stop, 10)
+        self.create_subscription(String, "/dryrun/point_at", self._on_point_at, 10)
 
         self.create_timer(0.5, self._publish_scene)
         self._publish_state("idle")
         self.get_logger().info(
-            f"무대 준비: {', '.join(self.present)} · 동작 {action_seconds:.1f}초")
+            f"무대 준비: {', '.join(self.present)} · 동작 {action_seconds:.1f}초 · "
+            f"가리키는 것: {self.point_at or '(없음)'}")
 
     # ------------------------------------------------------------- 장면
 
@@ -90,6 +130,49 @@ class Stage(Node):
             item.depth_m = 0.5
             message.objects.append(item)
         self.scene_publisher.publish(message)
+        self._publish_annotated(present, message.header)
+
+    def _publish_annotated(self, present: list[str], header) -> None:
+        """라벨 그려진 화면. 박스 위 글자가 곧 scene의 id다 -- 그 둘이 같은
+        문자열이라는 것이 모델이 그림과 JSON을 잇는 유일한 끈이다."""
+        frame = np.full((*FRAME_SIZE, 3), 240, dtype=np.uint8)
+        centres = {}
+        for object_id, class_name, color, x, y in TABLE:
+            if object_id not in present:
+                continue
+            column, row = table_to_pixel(x, y)
+            centres[object_id] = (column, row)
+            swatch = SWATCH.get(color, (120, 120, 120))
+            cv2.rectangle(frame, (column - BOX_HALF, row - BOX_HALF),
+                          (column + BOX_HALF, row + BOX_HALF), swatch, -1)
+            cv2.rectangle(frame, (column - BOX_HALF, row - BOX_HALF),
+                          (column + BOX_HALF, row + BOX_HALF), (40, 40, 40), 2)
+            cv2.putText(frame, object_id, (column - BOX_HALF, row - BOX_HALF - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (40, 40, 40), 2, cv2.LINE_AA)
+
+        with self.lock:
+            target = self.point_at
+        if target in centres:
+            column, row = centres[target]
+            # 아래에서 위로 찌르는 화살표. 사람 손가락 대역이다.
+            cv2.arrowedLine(frame, (column, min(FRAME_SIZE[0] - 5, row + 150)),
+                            (column, row + BOX_HALF + 8), (20, 20, 20), 6,
+                            tipLength=0.35)
+
+        message = Image()
+        message.header = header
+        message.height, message.width = frame.shape[:2]
+        message.encoding = "bgr8"
+        message.is_bigendian = 0
+        message.step = frame.shape[1] * 3
+        message.data = frame.tobytes()
+        self.image_publisher.publish(message)
+
+    def _on_point_at(self, message: String) -> None:
+        target = message.data.strip()
+        with self.lock:
+            self.point_at = target
+        self.get_logger().info(f"가리키는 것: {target or '(없음)'}")
 
     # ------------------------------------------------------------- 로봇
 
@@ -139,10 +222,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--action-seconds", type=float, default=1.5,
                         help="동작 하나가 걸리는 시간. 끼어들기를 시험하려면 늘린다")
+    parser.add_argument("--point-at", default="apple_2",
+                        help="화살표가 가리킬 물체 id. 빈 문자열이면 안 그린다")
     args = parser.parse_args()
 
     rclpy.init()
-    node = Stage(args.action_seconds)
+    node = Stage(args.action_seconds, args.point_at)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

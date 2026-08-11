@@ -23,10 +23,12 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from vla_interfaces.msg import AgentReply, RobotAction, RobotState, SceneSnapshot
 
@@ -40,11 +42,16 @@ from vla_system.agent.llm import AgentLLM
 from vla_system.agent.rules import RuleStore
 from vla_system.agent.skill_tier import SceneItem, SkillTier, make_parser
 from vla_system.agent.tools import MOTION_TOOLS
+from vla_system.agent.vision import encode_frame
 
 
 class AgentNode(Node):
-    def __init__(self):
-        super().__init__("vla_agent")
+    def __init__(self, **node_kwargs):
+        # node_kwargs exists for parameter_overrides. Some parameters decide
+        # what gets built here in __init__ -- vision_enabled decides whether
+        # the camera topic is subscribed at all -- and setting those after
+        # construction is too late. Launch delivers them the same way.
+        super().__init__("vla_agent", **node_kwargs)
 
         self.declare_parameter("utterance_topic", "/vla/user_utterance")
         self.declare_parameter("scene_topic", "/vla/scene")
@@ -53,6 +60,7 @@ class AgentNode(Node):
         self.declare_parameter("stop_topic", "/vla/robot/stop")
         self.declare_parameter("estop_topic", "/vla/estop")
         self.declare_parameter("reply_topic", "/vla/agent/reply")
+        self.declare_parameter("annotated_topic", "/vla/perception/annotated_image")
 
         self.declare_parameter("model", "gpt-5-mini")
         self.declare_parameter("stt_model", "gpt-4o-transcribe")
@@ -78,6 +86,16 @@ class AgentNode(Node):
         # Long-term rules outlive the process. Empty string keeps them in
         # memory only, which is what the evaluation harness wants.
         self.declare_parameter("rule_store_path", "~/.ros/vla_rules.json")
+        # The labelled camera frame, sent with what the user said. Without it
+        # "이거 집어줘" cannot be answered at all -- see agent/vision.py. Off
+        # makes the agent text-only again, exactly as it was before.
+        self.declare_parameter("vision_enabled", True)
+        self.declare_parameter("vision_max_width", 640)
+        self.declare_parameter("vision_jpeg_quality", 70)
+        # A frame older than this is not sent. A dead camera would otherwise
+        # keep answering "이거" with a picture of a table that has since been
+        # cleared -- worse than having no picture, because it looks answered.
+        self.declare_parameter("vision_max_age_s", 2.0)
 
         self.max_tool_rounds = int(self.get_parameter("max_tool_rounds").value)
         self.max_consecutive_failures = int(
@@ -115,6 +133,13 @@ class AgentNode(Node):
         self.turn_epoch = 0
         self.turn_stamp = None
         self.turn_spoke = False
+
+        # Latest labelled frame, kept as BGR. Encoding to JPEG happens on the
+        # worker thread at decision time, not here -- this callback runs at
+        # camera rate on the executor thread, and that thread also carries the
+        # scene and stop subscriptions.
+        self.frame = None
+        self.frame_monotonic = 0.0
 
         self.llm: AgentLLM | None = None
         self.llm_error = ""
@@ -174,6 +199,17 @@ class AgentNode(Node):
             self.estop_callback,
             command_qos,
         )
+        if bool(self.get_parameter("vision_enabled").value):
+            # Same QoS as the scene stream: perception publishes both from the
+            # same frame, and RELIABLE here would simply never match a
+            # BEST_EFFORT publisher -- the subscription would sit silent with
+            # no error at all.
+            self.create_subscription(
+                Image,
+                str(self.get_parameter("annotated_topic").value),
+                self.annotated_callback,
+                stream_qos,
+            )
 
         self.worker = threading.Thread(
             target=self.run_worker, name="vla-agent-worker", daemon=True
@@ -189,6 +225,48 @@ class AgentNode(Node):
     def scene_callback(self, message: SceneSnapshot) -> None:
         with self.lock:
             self.scene = message
+
+    def annotated_callback(self, message: Image) -> None:
+        from vla_system.perception.detector import image_message_to_bgr
+
+        try:
+            frame = image_message_to_bgr(message)
+        except Exception as exc:                       # noqa: BLE001
+            # A frame we cannot decode must not take the last good one down
+            # with it, and must not spam the log at camera rate either.
+            self.get_logger().warning(
+                f"주석 프레임을 읽지 못했습니다: {exc}", throttle_duration_sec=10.0
+            )
+            return
+        with self.lock:
+            self.frame = frame
+            self.frame_monotonic = monotonic()
+
+    def current_frame_image(self) -> str:
+        """이번 판단에 실어 보낼 사진. 없거나 오래됐으면 빈 문자열."""
+        if not bool(self.get_parameter("vision_enabled").value):
+            return ""
+        with self.lock:
+            frame, taken_at = self.frame, self.frame_monotonic
+        if frame is None:
+            return ""
+
+        age = monotonic() - taken_at
+        max_age = float(self.get_parameter("vision_max_age_s").value)
+        if max_age > 0 and age > max_age:
+            # Stale beyond use. Saying nothing is right: the model is told the
+            # picture may be absent, and a picture of a table that has since
+            # changed would be answered confidently and wrongly.
+            self.get_logger().warning(
+                f"카메라 화면이 {age:.1f}초 지나 이번 판단에서 뺐습니다",
+                throttle_duration_sec=10.0,
+            )
+            return ""
+        return encode_frame(
+            frame,
+            max_width=int(self.get_parameter("vision_max_width").value),
+            quality=int(self.get_parameter("vision_jpeg_quality").value),
+        )
 
     def utterance_callback(self, message: String) -> None:
         text = message.data.strip()
@@ -436,6 +514,12 @@ class AgentNode(Node):
             build_situation(event, scene_to_payload(scene), robot_state_to_payload(state))
         )
 
+        # Only what a person said can be ambiguous in a way a picture settles.
+        # "이거" needs the frame; "the action you started finished" does not,
+        # and sending one there would pay for vision on every step of a
+        # multi-object mission for nothing.
+        image = self.current_frame_image() if event.get("type") == "user_said" else ""
+
         try:
             llm = self.get_llm()
         except Exception as exc:
@@ -444,10 +528,14 @@ class AgentNode(Node):
 
         for _ in range(self.max_tool_rounds):
             try:
-                response = llm.respond(self.conversation.items())
+                response = llm.respond(self.conversation.items(), image=image)
             except Exception as exc:
                 self.publish_reply("error", f"LLM 호출에 실패했습니다: {exc}")
                 return
+            # Rounds after the first are the model working through tool
+            # results, not re-reading the table. The reference it needed the
+            # picture for is already resolved into a call by now.
+            image = ""
 
             # Free text and the tool's own `say` are two routes to the same
             # place, so only one of them is spoken per round.
