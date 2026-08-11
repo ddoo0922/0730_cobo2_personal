@@ -28,6 +28,8 @@ def generate_launch_description():
     enable_wrist_grasp = LaunchConfiguration("enable_wrist_grasp")
     enable_robot = LaunchConfiguration("enable_robot")
     enable_pick_bridge = LaunchConfiguration("enable_pick_bridge")
+    skill_tier_enabled = LaunchConfiguration("skill_tier_enabled")
+    rule_store_path = LaunchConfiguration("rule_store_path")
 
     realsense = GroupAction(
         condition=IfCondition(enable_realsense),
@@ -80,6 +82,18 @@ def generate_launch_description():
             # built, class allow-lists not reconciled. Turn on deliberately,
             # never as the default path, until those are answered.
             DeclareLaunchArgument("enable_pick_bridge", default_value="false"),
+            # Off by default -- see agent_node.py's declare_parameter for why.
+            # NOTE: this argument only has effect because it is explicitly
+            # forwarded into agent_node's parameters below. A launch argument
+            # that is declared but never passed into a Node's `parameters=[]`
+            # does nothing -- `ros2 launch ... skill_tier_enabled:=true` would
+            # silently no-op without that forwarding, and it did exactly that
+            # before this fix (2026-08-11): the flag was readable by `ros2 run`
+            # with `--ros-args -p`, which bypasses this file entirely, but not
+            # by `ros2 launch`, which is what the GUI actually uses.
+            DeclareLaunchArgument("skill_tier_enabled", default_value="false"),
+            DeclareLaunchArgument("rule_store_path",
+                                  default_value="~/.ros/vla_rules.json"),
             realsense,
             Node(
                 package="vla_system",
@@ -94,7 +108,10 @@ def generate_launch_description():
                 name="vla_agent",
                 output="screen",
                 condition=IfCondition(enable_agent),
-                parameters=[params_file],
+                parameters=[params_file, {
+                    "skill_tier_enabled": skill_tier_enabled,
+                    "rule_store_path": rule_store_path,
+                }],
             ),
             Node(
                 package="vla_system",
