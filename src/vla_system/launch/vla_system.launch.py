@@ -23,6 +23,7 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     params_file = LaunchConfiguration("params_file")
     enable_realsense = LaunchConfiguration("enable_realsense")
+    enable_perception = LaunchConfiguration("enable_perception")
     enable_agent = LaunchConfiguration("enable_agent")
     motion_enabled = LaunchConfiguration("motion_enabled")
     enable_wrist_grasp = LaunchConfiguration("enable_wrist_grasp")
@@ -70,6 +71,11 @@ def generate_launch_description():
                 ),
             ),
             DeclareLaunchArgument("enable_realsense", default_value="true"),
+            # 카메라 인식 노드. 끄면 /vla/scene을 아무도 안 내보내므로 판단
+            # 계층은 빈 테이블을 본다 -- eval/dryrun_stage.py가 그 자리를 대신
+            # 채우는 용도다(GPU 없는 개발 머신, 또는 팔·카메라 없이 대화 흐름만
+            # 볼 때). 둘을 동시에 띄우면 같은 토픽에 둘이 발행해 서로 덮는다.
+            DeclareLaunchArgument("enable_perception", default_value="true"),
             DeclareLaunchArgument("enable_agent", default_value="true"),
             DeclareLaunchArgument("motion_enabled", default_value="false"),
             DeclareLaunchArgument("enable_wrist_grasp", default_value="false"),
@@ -82,7 +88,7 @@ def generate_launch_description():
             # built, class allow-lists not reconciled. Turn on deliberately,
             # never as the default path, until those are answered.
             DeclareLaunchArgument("enable_pick_bridge", default_value="false"),
-            # Off by default -- see agent_node.py's declare_parameter for why.
+            # On by default -- see agent_node.py's declare_parameter for why.
             # NOTE: this argument only has effect because it is explicitly
             # forwarded into agent_node's parameters below. A launch argument
             # that is declared but never passed into a Node's `parameters=[]`
@@ -91,7 +97,7 @@ def generate_launch_description():
             # before this fix (2026-08-11): the flag was readable by `ros2 run`
             # with `--ros-args -p`, which bypasses this file entirely, but not
             # by `ros2 launch`, which is what the GUI actually uses.
-            DeclareLaunchArgument("skill_tier_enabled", default_value="false"),
+            DeclareLaunchArgument("skill_tier_enabled", default_value="true"),
             DeclareLaunchArgument("rule_store_path",
                                   default_value="~/.ros/vla_rules.json"),
             realsense,
@@ -100,6 +106,7 @@ def generate_launch_description():
                 executable="perception_node",
                 name="vla_perception",
                 output="screen",
+                condition=IfCondition(enable_perception),
                 parameters=[params_file],
             ),
             Node(

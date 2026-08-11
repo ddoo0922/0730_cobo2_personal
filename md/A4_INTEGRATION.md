@@ -7,20 +7,28 @@
 
 ---
 
-## 0. 먼저 알 것 — 기본값이 꺼짐이다
+## 0. 먼저 알 것 — 끄는 것이 파라미터 한 줄이다
 
 ```yaml
 # src/vla_system/config/system.yaml
 vla_agent:
   ros__parameters:
-    skill_tier_enabled: false          # ← 기본값
+    skill_tier_enabled: true           # ← 기본값 (2026-08-11부터)
     rule_store_path: "~/.ros/vla_rules.json"
 ```
 
-**이 값이 false인 동안 `agent_node`는 통합 이전과 완전히 같이 동작한다.**
-머지해도 지금 돌아가는 것이 바뀌지 않는다. 되돌리기가 revert가 아니라 파라미터
-한 줄인 것은 의도한 설계다 — 실기에서 문제가 생겼을 때 코드를 되감는 것보다
-값을 바꾸는 편이 빠르고 안전하다.
+**이 값이 false면 `agent_node`는 통합 이전과 완전히 같이 동작한다** — 모든
+발화가 LLM으로 가고, 세션을 넘는 기억이 없다. 되돌리기가 revert가 아니라
+파라미터 한 줄인 것은 의도한 설계다. 실기에서 문제가 생겼을 때 코드를 되감는
+것보다 값을 바꾸는 편이 빠르고 안전하다.
+
+**기본값이 처음에는 false였다(2026-08-11 오전 → 오후에 뒤집음).** 계층이
+검증되는 동안 머지해도 아무것도 안 바뀌게 하려던 것이었는데, 그 사이에 이
+플래그가 조용히 무시되는 배선 결함이 두 번 나왔다(§6-B). 둘 다 "켰다고
+생각했는데 안 켜져 있었다"는 같은 모양이었고, 기본이 꺼짐인 한 그 실패는
+계속 조용할 수밖에 없다. 측정이 끝난 지금(§7) 기본을 켜짐으로 두는 편이
+맞다 — **끄는 쪽이 더 안전한 설정도 아니다.** 이 계층은 자기 동작을 새로
+만들지 않고 거르기만 하며, 가위를 확인 없이 집지 않게 막는 것도 이쪽이다.
 
 ---
 
@@ -74,27 +82,34 @@ class SkillHost(Protocol):
 
 ### 2-1. 파라미터 off로 회귀 확인 (API 소량)
 
-먼저 **아무것도 안 바뀌었는지**부터 본다.
+먼저 **끄면 아무것도 안 바뀌는지**부터 본다. 기본이 켜짐이니 이건 명시적으로
+꺼서 확인해야 한다.
 
 ```bash
 colcon build --packages-select vla_interfaces vla_system --symlink-install
 source install/setup.bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest src/vla_system/test/ -q
-# 314개 통과해야 한다 (기존 296 + 신규 18)
+# 302개 통과해야 한다
+
+ros2 launch vla_system vla_system.launch.py skill_tier_enabled:=false
 ```
 
-그다음 평소 쓰던 방식으로 한 바퀴 돌려 **말투와 동작이 예전과 같은지** 본다.
-다르면 통합이 뭔가 건드린 것이므로 켜기 전에 원인을 찾아야 한다.
+평소 쓰던 방식으로 한 바퀴 돌려 **말투와 동작이 예전과 같은지** 본다. 다르면
+통합이 뭔가 건드린 것이므로 켜고 쓰기 전에 원인을 찾아야 한다.
 
 ### 2-2. 규칙 계층만 단독으로 (로봇 없이)
 
 ```bash
-ros2 run vla_system agent_node --ros-args \
-  -p skill_tier_enabled:=true \
-  -p rule_store_path:=""          # 메모리에만. 파일을 더럽히지 않는다
+# 가짜 무대 -- 카메라도 팔도 없이 돌린다
+python3 -m eval.dryrun_stage &
+ros2 launch vla_system vla_system.launch.py \
+  enable_perception:=false enable_realsense:=false enable_pick_bridge:=false \
+  rule_store_path:=/tmp/rules.json      # 진짜 파일을 더럽히지 않는다
 ```
 
-다른 터미널에서 장면을 흘려 넣고 발화를 던진다. 확인할 것:
+GUI(`ros2 run vla_system vla_gui`)로 해도 된다 — 체크박스에서 **"카메라 인식"과
+"cobot2_ws FSM 연동"을 끄고** "규칙 계층 (Tier 1)"을 켠 채 시작하면 위와 같은
+조합이 된다. 확인할 것:
 
 | 발화 | 기대 |
 |---|---|
@@ -108,8 +123,8 @@ ros2 run vla_system agent_node --ros-args \
 **여기가 가장 위험하다.** `vla_pick_bridge_node`와 함께 띄운 적이 없다.
 
 ```bash
-ros2 launch vla_system vla_system.launch.py motion_enabled:=false
-# + skill_tier_enabled:=true
+ros2 launch vla_system vla_system.launch.py \
+  motion_enabled:=false enable_pick_bridge:=true
 ```
 
 `motion_enabled:=false`로 시작한다. 확인할 것:
@@ -193,12 +208,36 @@ def pick(self, object_id, reason):
 | **"오늘은 A니까 B하지 마"에서 되묻지 않고 짐작한다.** 짐작이 맞긴 했다 | 하 | 안전 방향. 그대로 둠 |
 | 조사 처리가 거칠다 — `"컵은(는)"` | 하 | 말투 문제. 기능 무관 |
 | 위험물 게이트가 쉬운 명령에서도 뜬다 | 하 | 안전 방향. 시나리오 기대와 다를 뿐 |
-| **카메라가 30Hz로 갱신되는 중 미션이 진행되면?** 미검증 | **미상** | 실기에서 봐야 함 |
 | **`track_id`가 재검출 시 바뀐다.** 후보 정렬에 쓰는데 실험에서는 고정이었다 | **미상** | 실기에서 봐야 함 |
 | **동작 실패(`last_result="failed"`) 후 재시도 정책이 없다** | **미상** | 실기에서 봐야 함 |
 
-마지막 셋이 진짜 위험이다. **실험 하네스가 재현하지 않은 것들**이라 아무 데이터도
+마지막 둘이 진짜 위험이다. **실험 하네스가 재현하지 않은 것들**이라 아무 데이터도
 없다.
+
+원래 여기 셋째로 "카메라가 30Hz로 갱신되는 중 미션이 진행되면?"이 있었다.
+`eval/dryrun_stage.py`로 진짜 ROS 그래프 위에 올려 보니 바로 터졌다 — **같은
+사과를 두 번 집었다.** 팔과 카메라가 다른 시계로 도는 탓에 방금 집은 물체가
+최신 스냅샷에 아직 남아 있는데, 후보를 장면에서만 고르고 있었다. 하네스는 이걸
+보여줄 수 없었다(드라이버가 결과를 보고하기 *전에* 장면을 갱신한다). 이미 보낸
+물체를 미션이 기억하도록 고쳤고(`baa54a5`), 회귀 테스트가 있다.
+
+### 6-B. 조용히 안 켜지는 배선 — 두 번 났다
+
+같은 날 두 번, 규칙 계층이 **켠 줄 알았는데 안 켜진 채** 돌았다. 둘 다 예외를
+던지지 않아서, 증상은 며칠 뒤 "말한 규칙이 재시작하면 사라진다"로만 보였다.
+
+1. launch가 `skill_tier_enabled`를 **선언만 하고** `agent_node`의
+   `parameters=[]`로 넘기지 않았다. `ros2 launch ... skill_tier_enabled:=true`가
+   조용히 무시됐다. `ros2 run --ros-args -p`는 launch 파일을 안 거쳐서 잘 됐고,
+   그래서 초기 스모크 테스트가 이걸 못 잡았다 — **실제로 쓰는 경로(GUI)로
+   확인해야 한다는 뜻이다.**
+2. 고친 뒤에도 GUI의 "VLA 시작"이 그 인자를 **아예 안 보냈다.** 체크박스조차
+   없어서 켤 방법이 없었다.
+
+`test_gui_launch_arguments.py`가 이 둘을 막는다 — GUI가 보내는 인자가 launch에
+선언돼 있는지, launch가 그것을 노드 파라미터로 실제로 넘기는지 검사한다.
+**이런 종류의 인자를 추가할 때는 세 곳(GUI·launch 선언·Node parameters)을 다
+건드려야 한다는 것을 기억할 것.**
 
 ---
 

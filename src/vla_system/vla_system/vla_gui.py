@@ -90,6 +90,30 @@ BASE_LAUNCH_COMMAND = [
     "vla_system.launch.py",
 ]
 
+
+def build_launch_command(
+    *, pick_bridge: bool, wrist_grasp: bool, skill_tier: bool, perception: bool
+) -> list[str]:
+    """체크박스 상태 -> `ros2 launch` 인자.
+
+    App 밖의 순수 함수인 이유: 여기서 인자 하나가 빠져도 예외가 나지 않는다.
+    launch 기본값이 조용히 이기고, 증상은 한참 떨어진 곳에서 "규칙이 기억되지
+    않는다"로만 보인다 -- 2026-08-11에 `skill_tier_enabled`가 정확히 그렇게
+    빠져 있었다. 화면 없이 검사할 수 있어야 그걸 테스트가 잡는다.
+    """
+    return BASE_LAUNCH_COMMAND + [
+        f"enable_pick_bridge:={'true' if pick_bridge else 'false'}",
+        # pick_bridge 켜짐 = cobot2_ws 쪽 launch가 카메라를 이미 잡고 있다는 전제
+        # (README §4) -- 여기서 또 열면 V4L2 충돌 위험. 꺼짐 = 이 ws 단독 실행이니
+        # 이 ws가 카메라를 연다(예전 기본값). "카메라 인식"을 끈 경우는 어느
+        # 쪽이든 열지 않는다 -- 그 체크박스는 카메라가 아예 없는 상태(가짜 무대)를
+        # 뜻하고, RealSense만 살아 있으면 launch가 장치를 못 찾고 죽는다.
+        f"enable_realsense:={'true' if perception and not pick_bridge else 'false'}",
+        f"enable_wrist_grasp:={'true' if wrist_grasp else 'false'}",
+        f"skill_tier_enabled:={'true' if skill_tier else 'false'}",
+        f"enable_perception:={'true' if perception else 'false'}",
+    ]
+
 _INTERESTING_LOG_TOKENS = (
     "error",
     "warn",
@@ -427,6 +451,17 @@ class VLAApp:
         # 한다. 켜져 있으면 enable_pick_bridge:=true + enable_realsense:=false(카메라는
         # cobot2_ws 쪽 launch가 이미 잡고 있다는 전제, README §4)를 같이 보낸다.
         self.pick_bridge_var = tk.BooleanVar(value=True)
+        # 규칙 계층(Tier 1). launch/system.yaml 기본값은 false지만 이 GUI에서는
+        # 켜고 시작한다 -- 이 창이 존재하는 이유가 규칙 계층을 사람이 만져 보는
+        # 것이고, 꺼졌을 때의 동작(전부 LLM으로 감)은 예전과 똑같아서 켜는 쪽이
+        # 더 위험하지도 않다. 2026-08-11: 이 인자를 안 보내던 탓에 GUI로 켠
+        # 파이프라인은 항상 Tier 1이 꺼진 채였고, "앞으로 사과 집지 마"가 재시작
+        # 후 사라지는 것으로 나타났다(A2에는 세션을 넘는 기억이 없다).
+        self.skill_tier_var = tk.BooleanVar(value=True)
+        # 카메라 인식. GPU가 없는 개발 머신이나 eval/dryrun_stage.py로 무대를
+        # 대신 세울 때는 꺼야 한다 -- perception_node는 YOLO를 cuda:0에 올리려다
+        # 죽고, dryrun_stage와 동시에 뜨면 /vla/scene에 둘이 발행해 서로 덮는다.
+        self.perception_var = tk.BooleanVar(value=True)
 
         self._configure_window()
         self._configure_style()
@@ -540,10 +575,22 @@ class VLAApp:
         )
         self.wrist_check.grid(row=0, column=2, padx=(0, 8))
 
+        # 끄면 예전 경로 그대로 -- 모든 발화가 LLM으로 가고 규칙은 기억되지 않는다.
+        self.skill_tier_check = ttk.Checkbutton(
+            controls, text="규칙 계층 (Tier 1)", variable=self.skill_tier_var
+        )
+        self.skill_tier_check.grid(row=0, column=3, padx=(0, 8))
+
+        # 끄면 카메라 없이 뜬다. eval/dryrun_stage.py로 무대를 대신 세울 때 쓴다.
+        self.perception_check = ttk.Checkbutton(
+            controls, text="카메라 인식", variable=self.perception_var
+        )
+        self.perception_check.grid(row=0, column=4, padx=(0, 8))
+
         self.pipeline_button = ttk.Button(
             controls, text="VLA 시작", command=self.toggle_pipeline
         )
-        self.pipeline_button.grid(row=0, column=3)
+        self.pipeline_button.grid(row=0, column=5)
 
         # ------------------------------------------------- left: perception
 
@@ -958,16 +1005,12 @@ class VLAApp:
         # enable_robot은 launch 기본값 false 그대로 -- GUI에서 실제 로봇 모션을 켜는
         # 경로 자체가 없다(cobot2_ws pick_fsm이 전담, 위 "제거" 주석 참고). motion_enabled
         # 인자도 그래서 안 보낸다: vla_robot 자체가 안 뜨니 값을 줘도 아무 효과가 없다.
-        wrist_grasp = bool(self.wrist_grasp_var.get())
-        pick_bridge = bool(self.pick_bridge_var.get())
-        command = BASE_LAUNCH_COMMAND + [
-            f"enable_pick_bridge:={'true' if pick_bridge else 'false'}",
-            # pick_bridge 켜짐 = cobot2_ws 쪽 launch가 카메라를 이미 잡고 있다는 전제
-            # (README §4) -- 여기서 또 열면 V4L2 충돌 위험. 꺼짐 = 이 ws 단독 실행이니
-            # 이 ws가 카메라를 연다(예전 기본값).
-            f"enable_realsense:={'false' if pick_bridge else 'true'}",
-            f"enable_wrist_grasp:={'true' if wrist_grasp else 'false'}",
-        ]
+        command = build_launch_command(
+            pick_bridge=bool(self.pick_bridge_var.get()),
+            wrist_grasp=bool(self.wrist_grasp_var.get()),
+            skill_tier=bool(self.skill_tier_var.get()),
+            perception=bool(self.perception_var.get()),
+        )
         try:
             process = subprocess.Popen(
                 command,

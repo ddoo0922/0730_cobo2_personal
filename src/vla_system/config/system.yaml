@@ -187,9 +187,10 @@ vla_agent:
     # agent asks the user instead of retrying forever.
     max_consecutive_failures: 3
     continue_after_action: true
-    # Tier 1 -- 규칙 계층. 기본은 꺼짐이라 켜기 전까지 이 노드는
-    # 예전과 똑같이 동작한다. 되돌리기가 revert가 아니라 파라미터다.
-    skill_tier_enabled: false
+    # Tier 1 -- 규칙 계층. 2026-08-11부터 기본 켜짐(검증이 끝나 기본이 됐다,
+    # md/A4_INTEGRATION.md §7). 끄면 이 노드는 계층이 없던 때와 똑같이
+    # 동작한다 -- 되돌리기가 revert가 아니라 파라미터다.
+    skill_tier_enabled: true
     rule_store_path: "~/.ros/vla_rules.json"
 
 vla_robot:

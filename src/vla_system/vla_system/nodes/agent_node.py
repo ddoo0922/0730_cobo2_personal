@@ -62,15 +62,19 @@ class AgentNode(Node):
         self.declare_parameter("max_history_items", 60)
         self.declare_parameter("max_consecutive_failures", 3)
         self.declare_parameter("continue_after_action", True)
-        # Tier 1 -- the rule layer in front of this node. Off by default: with
-        # it off this node behaves exactly as it did before the layer existed,
-        # which is what makes the comparison between the two honest and the
-        # rollback a parameter rather than a revert.
         # Empty string turns logging off. Independent of max_history_items:
         # that window bounds what the LLM sees, this bounds nothing -- the
         # full transcript survives trimming and the node restarting.
         self.declare_parameter("conversation_log_dir", "~/.ros/vla_conversations")
-        self.declare_parameter("skill_tier_enabled", False)
+        # Tier 1 -- the rule layer in front of this node. On by default since
+        # 2026-08-11: it was off while the layer was being proven, and the
+        # measurements are in (md/A4_INTEGRATION.md §7). Turning it off still
+        # restores the previous behaviour exactly -- every utterance goes to
+        # the LLM and nothing is remembered between sessions -- so the rollback
+        # is this parameter, not a revert. Off is not the safer setting: the
+        # layer adds no motion of its own, and it is what refuses to pick up
+        # scissors without asking.
+        self.declare_parameter("skill_tier_enabled", True)
         # Long-term rules outlive the process. Empty string keeps them in
         # memory only, which is what the evaluation harness wants.
         self.declare_parameter("rule_store_path", "~/.ros/vla_rules.json")
