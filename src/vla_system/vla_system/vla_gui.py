@@ -289,7 +289,13 @@ class GuiRosBridge(Node):
                     "class_name": scene_object.class_name,
                     "confidence": float(scene_object.confidence),
                     "color": scene_object.color or "unknown",
-                    "pickable": bool(scene_object.position_valid),
+                    # This ws's own perception coordinate availability, for the
+                    # debug panel only. NOT pickability: cobot2_ws computes the
+                    # grasp coordinate itself, so every visible object is
+                    # pickable regardless of this (conversation.py sends
+                    # pickable=True to the model). Named accordingly so the two
+                    # meanings don't get conflated again.
+                    "has_position": bool(scene_object.position_valid),
                     "bbox": (
                         float(scene_object.x_min),
                         float(scene_object.y_min),
@@ -552,7 +558,7 @@ class VLAApp:
 
         self.scene_tree = ttk.Treeview(
             table_frame,
-            columns=("id", "color", "conf", "pickable", "position"),
+            columns=("id", "color", "conf", "coord", "position"),
             show="headings",
             height=8,
         )
@@ -560,10 +566,10 @@ class VLAApp:
             "id": "LLM이 부르는 이름",
             "color": "color",
             "conf": "conf",
-            "pickable": "집기 가능",
+            "coord": "좌표 있음",
             "position": "base 좌표 (m)",
         }
-        widths = {"id": 150, "color": 90, "conf": 60, "pickable": 80, "position": 210}
+        widths = {"id": 150, "color": 90, "conf": 60, "coord": 80, "position": 210}
         for name, label in headings.items():
             self.scene_tree.heading(name, text=label)
             self.scene_tree.column(name, width=widths[name], anchor="center")
@@ -1158,12 +1164,13 @@ class VLAApp:
         if scene is None:
             self.vision_status_var.set("장면 데이터 대기 중")
         else:
-            pickable = sum(1 for obj in scene["objects"] if obj["pickable"])
+            with_coord = sum(1 for obj in scene["objects"] if obj["has_position"])
             warning = (
-                "" if scene["calibration_ok"] else " | ⚠ 테이블 보정 없음 (좌표 사용 불가)"
+                "" if scene["calibration_ok"]
+                else " | ⚠ 테이블 보정 없음 (좌표 표시 안 됨, 집기는 가능)"
             )
             self.vision_status_var.set(
-                f"물체 {len(scene['objects'])}개 (집기 가능 {pickable}개) | "
+                f"물체 {len(scene['objects'])}개 (좌표 있음 {with_coord}개) | "
                 f"GUI {self.current_fps:.1f} FPS{warning}"
             )
 
@@ -1188,8 +1195,8 @@ class VLAApp:
                     obj["id"],
                     obj["color"],
                     f"{obj['confidence']:.2f}",
-                    "O" if obj["pickable"] else "X",
-                    f"({x:.3f}, {y:.3f}, {z:.3f})" if obj["pickable"] else "-",
+                    "O" if obj["has_position"] else "X",
+                    f"({x:.3f}, {y:.3f}, {z:.3f})" if obj["has_position"] else "-",
                 ),
             )
 
