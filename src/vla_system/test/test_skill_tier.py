@@ -213,6 +213,22 @@ def test_ambiguous_single_pick_escalates_rather_than_guessing():
     assert "ambiguous" in host.escalated
 
 
+def test_a_stale_scene_does_not_cause_a_second_pick():
+    """The executor and the camera run on different clocks. A just-taken object
+    is often still in the newest snapshot, and trusting it picked the same
+    apple twice on a real ROS graph."""
+    scene = [SceneItem("a1", "apple", "red", rank=1),
+             SceneItem("a2", "apple", "red", rank=2)]
+    host, tier = build(scene, {"사과 다 담아줘": parsed(classes=["apple"], quantity="all")})
+    host.pick = lambda oid, reason: host.picked.append(oid)   # scene never updates
+    tier.handle("사과 다 담아줘")
+    for _ in range(6):
+        if not tier.busy:
+            break
+        tier.on_action_finished()
+    assert host.picked == ["a1", "a2"], f"each object once, got {host.picked}"
+
+
 def test_mid_mission_utterance_goes_upstairs():
     host, tier = build(TABLE_SCENE, {"다 담아줘": parsed(quantity="all")})
     tier.handle("다 담아줘")

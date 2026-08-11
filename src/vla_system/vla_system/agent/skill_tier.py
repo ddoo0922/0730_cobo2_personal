@@ -553,8 +553,18 @@ class SkillTier:
         colors = set(parsed["colors"])
         exclude_classes = set(parsed.get("exclude_classes") or ())
         exclude_colors = set(parsed.get("exclude_colors") or ())
+        # Already dispatched in this mission. The scene is not guaranteed to
+        # have caught up: the executor reports "done" on its own topic and the
+        # camera republishes on its own clock, so a just-taken object is often
+        # still in the latest snapshot. Trusting the snapshot alone made the
+        # layer pick the same apple twice, every time, on a real ROS graph --
+        # the harness never showed it because its driver updates the scene
+        # before reporting the result.
+        taken = set(self._mission["picked"])
         found = []
         for item in self.host.scene_items():
+            if item.object_id in taken:
+                continue
             if not item.pickable:
                 continue
             if classes and item.class_name not in classes:
