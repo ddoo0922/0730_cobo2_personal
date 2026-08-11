@@ -8,11 +8,20 @@ What is *not* in the history: scene snapshots and robot state. Those are
 rebuilt fresh on every call and attached to the newest message only. Letting
 them accumulate would both blow up the context and, worse, leave the model
 reasoning over positions that were true thirty seconds ago.
+
+Persistence
+-----------
+``_items`` is a bounded window -- only what the model still sees. If a
+``log_path`` is given, every item is also appended to that file before
+trimming, so the full transcript survives ``_trim`` dropping old turns from
+memory, and survives the node restarting.
 """
 
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
+from pathlib import Path
 
 
 def scene_to_payload(scene, max_objects: int = 40) -> dict:
@@ -86,39 +95,65 @@ def build_situation(event: dict, scene_payload: dict, state_payload: dict) -> st
 class Conversation:
     """Bounded history in Responses-API item form."""
 
-    def __init__(self, max_items: int = 60):
+    def __init__(self, max_items: int = 60, log_path: str | Path | None = None):
         if max_items < 4:
             raise ValueError("max_items must leave room for at least one turn")
         self.max_items = max_items
         self._items: list[dict] = []
 
+        # log_path stays set after close() so a caller that decides not to
+        # keep this session's log (the eval harness, for one) can still find
+        # the file to remove it.
+        self.log_path: Path | None = None
+        self._log_file = None
+        if log_path:
+            self.log_path = Path(log_path)
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log_file = self.log_path.open("a", encoding="utf-8")
+
+    def _persist(self, item: dict) -> None:
+        if self._log_file is None:
+            return
+        record = {"logged_at": datetime.now(timezone.utc).isoformat(), **item}
+        self._log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._log_file.flush()
+
+    def close(self) -> None:
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
+
     # ------------------------------------------------------------- mutation
 
     def add_user(self, content: str) -> None:
-        self._items.append({"role": "user", "content": content})
+        item = {"role": "user", "content": content}
+        self._items.append(item)
+        self._persist(item)
         self._trim()
 
     def add_assistant(self, content: str) -> None:
         if not content.strip():
             return
-        self._items.append({"role": "assistant", "content": content})
+        item = {"role": "assistant", "content": content}
+        self._items.append(item)
+        self._persist(item)
         self._trim()
 
     def add_function_call(self, call_id: str, name: str, arguments: str) -> None:
-        self._items.append(
-            {
-                "type": "function_call",
-                "call_id": call_id,
-                "name": name,
-                "arguments": arguments,
-            }
-        )
+        item = {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+        }
+        self._items.append(item)
+        self._persist(item)
         self._trim()
 
     def add_function_output(self, call_id: str, output: str) -> None:
-        self._items.append(
-            {"type": "function_call_output", "call_id": call_id, "output": output}
-        )
+        item = {"type": "function_call_output", "call_id": call_id, "output": output}
+        self._items.append(item)
+        self._persist(item)
         self._trim()
 
     def clear(self) -> None:

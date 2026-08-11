@@ -21,6 +21,8 @@ import json
 import queue
 import threading
 import uuid
+from datetime import datetime
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
@@ -35,6 +37,8 @@ from vla_system.agent.conversation import (
     scene_to_payload,
 )
 from vla_system.agent.llm import AgentLLM
+from vla_system.agent.rules import RuleStore
+from vla_system.agent.skill_tier import SceneItem, SkillTier, make_parser
 from vla_system.agent.tools import MOTION_TOOLS
 
 
@@ -58,6 +62,18 @@ class AgentNode(Node):
         self.declare_parameter("max_history_items", 60)
         self.declare_parameter("max_consecutive_failures", 3)
         self.declare_parameter("continue_after_action", True)
+        # Tier 1 -- the rule layer in front of this node. Off by default: with
+        # it off this node behaves exactly as it did before the layer existed,
+        # which is what makes the comparison between the two honest and the
+        # rollback a parameter rather than a revert.
+        # Empty string turns logging off. Independent of max_history_items:
+        # that window bounds what the LLM sees, this bounds nothing -- the
+        # full transcript survives trimming and the node restarting.
+        self.declare_parameter("conversation_log_dir", "~/.ros/vla_conversations")
+        self.declare_parameter("skill_tier_enabled", False)
+        # Long-term rules outlive the process. Empty string keeps them in
+        # memory only, which is what the evaluation harness wants.
+        self.declare_parameter("rule_store_path", "~/.ros/vla_rules.json")
 
         self.max_tool_rounds = int(self.get_parameter("max_tool_rounds").value)
         self.max_consecutive_failures = int(
@@ -67,8 +83,12 @@ class AgentNode(Node):
             self.get_parameter("continue_after_action").value
         )
         self.conversation = Conversation(
-            max_items=int(self.get_parameter("max_history_items").value)
+            max_items=int(self.get_parameter("max_history_items").value),
+            log_path=self._conversation_log_path(),
         )
+
+        self.skill_tier: SkillTier | None = None
+        self._skill_pending = False   # Tier 1 asked something and is waiting
 
         self.scene: SceneSnapshot | None = None
         self.robot_state: RobotState | None = None
@@ -266,7 +286,7 @@ class AgentNode(Node):
             except queue.Empty:
                 continue
             try:
-                self.decide(event)
+                self.route(event)
             except Exception as exc:  # never let the loop die on one bad turn
                 self.get_logger().error(f"decision failed: {exc}")
                 self.publish_reply("error", f"판단 중 오류가 발생했습니다: {exc}")
@@ -281,6 +301,121 @@ class AgentNode(Node):
                 timeout_s=float(self.get_parameter("request_timeout_s").value),
             )
         return self.llm
+
+    # ------------------------------------------------------------- storage
+
+    def _conversation_log_path(self) -> Path | None:
+        """One file per node start. Timestamp is the only identity it needs --
+        nothing else in this node distinguishes one run from the next."""
+        raw = str(self.get_parameter("conversation_log_dir").value)
+        if not raw:
+            return None
+        log_dir = Path(raw).expanduser()
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return log_dir / f"{stamp}.jsonl"
+
+    # ------------------------------------------------------------- Tier 1
+
+    def get_skill_tier(self) -> SkillTier | None:
+        """Built on first use, like the LLM client -- constructing it needs the
+        same OpenAI client, and a node that never gets an utterance should not
+        require an API key to start."""
+        if not bool(self.get_parameter("skill_tier_enabled").value):
+            return None
+        if self.skill_tier is None:
+            raw = str(self.get_parameter("rule_store_path").value)
+            store = RuleStore(Path(raw).expanduser() if raw else None)
+            parse = make_parser(self.get_llm().client,
+                                str(self.get_parameter("model").value))
+            self.skill_tier = SkillTier(self, store, parse)
+            self.get_logger().info(f"skill tier on, rules at {raw or '(memory)'}")
+        return self.skill_tier
+
+    # SkillHost. The rule layer speaks and acts through the same publishers the
+    # conversational path uses, so nothing downstream can tell them apart.
+
+    def scene_items(self) -> list[SceneItem]:
+        with self.lock:
+            scene = self.scene
+        if scene is None:
+            return []
+        return [
+            SceneItem(
+                object_id=o.id,
+                class_name=o.class_name,
+                color=o.color,
+                # No depth fix means the executor cannot reach it, whatever the
+                # rules decide. Same gate the conversational path applies.
+                pickable=bool(o.position_valid),
+                rank=int(o.track_id),
+            )
+            for o in scene.objects
+        ]
+
+    def pick(self, object_id: str, reason: str) -> None:
+        # place stays empty: the rule layer has no slot for a destination, so
+        # the bridge default (basket) applies. Utterances that name a place go
+        # to the conversational path, which does have that slot.
+        self.publish_action("pick_and_place", object_id, reason, "")
+
+    def escalate(self, reason: str, text: str, mission_text: str) -> None:
+        """Tier 1 declined. Hand the turn to the conversational agent."""
+        self._skill_pending = False
+        self.get_logger().info(f"skill tier -> llm ({reason})")
+        if mission_text:
+            # Without this the LLM does not know what was already underway and
+            # answers the correction as if it were a fresh request.
+            self.conversation.add_user(json.dumps({
+                "event": "skill_escalation", "reason": reason,
+                "original_utterance": mission_text,
+            }, ensure_ascii=False))
+        remembered = self.skill_tier.store.describe_all() if self.skill_tier else ""
+        if remembered and self.skill_tier and self.skill_tier.store.all:
+            self.conversation.add_user(json.dumps({
+                "event": "remembered_rules", "detail": remembered,
+            }, ensure_ascii=False))
+        self.decide({"type": "user_said", "text": text})
+
+    def note(self, event: dict) -> None:
+        self.conversation.add_user(json.dumps(event, ensure_ascii=False))
+
+    def record(self, tier: str, detail: str = "") -> None:
+        """Instrumentation hook. The harness overrides it; here it only logs."""
+        if detail:
+            self.get_logger().debug(f"tier={tier} {detail}")
+
+    def turn_done(self) -> None:
+        self._skill_pending = False
+
+    def say(self, text: str) -> None:
+        self.publish_reply("say", text)
+
+    def ask(self, text: str) -> None:
+        self._skill_pending = True
+        self.publish_reply("ask_clarification", text)
+
+    # ------------------------------------------------------------- decision
+
+    def route(self, event: dict) -> None:
+        """Try Tier 1 first; fall through to the conversational agent.
+
+        Only user utterances and the completion of a rule-dispatched action go
+        to Tier 1. Everything else -- errors, stops, state the rules have no
+        opinion on -- belongs to the conversation.
+        """
+        tier = self.get_skill_tier()
+        if tier is None:
+            self.decide(event)
+            return
+        if event.get("type") == "action_finished" and tier.busy:
+            tier.on_action_finished()
+            return
+        if event.get("type") == "user_said":
+            self.turn_epoch = self.stop_epoch
+            self.turn_stamp = self.get_clock().now().to_msg()
+            tier.handle(event["text"])
+            return
+        self.decide(event)
 
     def decide(self, event: dict) -> None:
         # Stamped once, at the point the world was read -- not at publish time.
