@@ -67,6 +67,29 @@ def table_to_pixel(x: float, y: float) -> tuple[int, int]:
             max(BOX_HALF, min(FRAME_SIZE[0] - BOX_HALF, row)))
 
 
+def arrow_for(column: int, row: int, length: int = 130):
+    """물체를 찌르는 화살표의 (꼬리, 촉). 사람 손가락 대역이다.
+
+    방향을 고르는 이유: 아래에서만 찌르면 화면 아래쪽 물체는 꼬리가 프레임
+    밖으로 나가 **사실상 안 그려진다.** 그림에 화살표가 없으면 모델은 짐작하지
+    않고 되묻는데(그게 맞는 동작이다), 시험하는 쪽은 "가리켰는데 왜 되묻지?"로
+    읽게 된다 -- 무대의 결함이 제품의 결함처럼 보인다. 2026-08-11에 가위가
+    정확히 그랬다.
+    """
+    gap = BOX_HALF + 8
+    height, width = FRAME_SIZE
+    # 아래 -> 위 -> 오른쪽 -> 왼쪽 순으로, 꼬리가 프레임 안에 들어오는 첫 방향.
+    for tail, tip in (
+        ((column, row + gap + length), (column, row + gap)),
+        ((column, row - gap - length), (column, row - gap)),
+        ((column + gap + length, row), (column + gap, row)),
+        ((column - gap - length, row), (column - gap, row)),
+    ):
+        if 0 <= tail[0] < width and 0 <= tail[1] < height:
+            return tail, tip
+    return (column, row + gap + length), (column, row + gap)
+
+
 def latched(depth: int = 1) -> QoSProfile:
     return QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=depth,
                       reliability=ReliabilityPolicy.RELIABLE,
@@ -80,9 +103,15 @@ def stream(depth: int = 1) -> QoSProfile:
 
 
 class Stage(Node):
-    def __init__(self, action_seconds: float, point_at: str) -> None:
+    def __init__(self, action_seconds: float, point_at: str,
+                 position_valid: bool = True) -> None:
         super().__init__("dryrun_stage")
         self.action_seconds = action_seconds
+        # cobot2_ws 연동에서는 이 ws가 테이블 보정을 하지 않아 3D 위치가 안
+        # 잡힌다 -- pick_fsm이 클래스 이름만 받아 자기 카메라로 좌표를 낸다.
+        # 그 구성을 흉내내려면 False. 판단 계층이 position_valid에 기대고 있으면
+        # 여기서 드러난다(2026-08-11 병합에서 실제로 그랬다).
+        self.position_valid = position_valid
         self.present = [row[0] for row in TABLE]
         self.holding = ""
         self.point_at = point_at
@@ -103,7 +132,8 @@ class Stage(Node):
         self._publish_state("idle")
         self.get_logger().info(
             f"무대 준비: {', '.join(self.present)} · 동작 {action_seconds:.1f}초 · "
-            f"가리키는 것: {self.point_at or '(없음)'}")
+            f"가리키는 것: {self.point_at or '(없음)'} · "
+            f"3D 위치 {'있음' if self.position_valid else '없음(cobot2_ws 연동 구성)'}")
 
     # ------------------------------------------------------------- 장면
 
@@ -125,7 +155,7 @@ class Stage(Node):
             item.color = color
             item.color_confidence = 0.9
             item.x_min, item.y_min, item.x_max, item.y_max = 0.0, 0.0, 10.0, 10.0
-            item.position_valid = True
+            item.position_valid = self.position_valid
             item.position_base.x, item.position_base.y, item.position_base.z = x, y, 0.10
             item.depth_m = 0.5
             message.objects.append(item)
@@ -153,11 +183,8 @@ class Stage(Node):
         with self.lock:
             target = self.point_at
         if target in centres:
-            column, row = centres[target]
-            # 아래에서 위로 찌르는 화살표. 사람 손가락 대역이다.
-            cv2.arrowedLine(frame, (column, min(FRAME_SIZE[0] - 5, row + 150)),
-                            (column, row + BOX_HALF + 8), (20, 20, 20), 6,
-                            tipLength=0.35)
+            tail, tip = arrow_for(*centres[target])
+            cv2.arrowedLine(frame, tail, tip, (20, 20, 20), 6, tipLength=0.35)
 
         message = Image()
         message.header = header
@@ -224,10 +251,14 @@ def main() -> None:
                         help="동작 하나가 걸리는 시간. 끼어들기를 시험하려면 늘린다")
     parser.add_argument("--point-at", default="apple_2",
                         help="화살표가 가리킬 물체 id. 빈 문자열이면 안 그린다")
+    parser.add_argument("--no-position", action="store_true",
+                        help="position_valid를 false로. cobot2_ws 연동 구성을 흉내낸다 "
+                             "-- 이 ws가 테이블 보정을 안 하는 상태다")
     args = parser.parse_args()
 
     rclpy.init()
-    node = Stage(args.action_seconds, args.point_at)
+    node = Stage(args.action_seconds, args.point_at,
+                 position_valid=not args.no_position)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
